@@ -1,0 +1,44 @@
+model:
+  name: "deberta"
+  pretrained_model_name: "microsoft/mdeberta-v3-base"
+  max_length: 256
+  granularity: "full"
+
+training:
+  output_dir: "outputs/checkpoints/deberta_full"
+  train_sample_size: -1
+  num_train_epochs: 3
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  learning_rate: 1.5e-5
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  label_smoothing_factor: 0.05
+
+optuna:
+  n_trials: 10
+  output_dir: "outputs/metrics/deberta_full_optuna"
+  tune_sample_size: 1000
+  score_metric: "pauc"
+  max_fpr: 0.01
+
+  # TRIAL #0: Enqueue known best DeBERTa parameters
+  enqueue_params:
+    num_train_epochs: 3
+    learning_rate: 1.5e-5
+    per_device_train_batch_size: 16
+    weight_decay: 0.05
+    warmup_ratio: 0.1
+    label_smoothing_factor: 0.05
+
+  search_space:
+    num_train_epochs: [2, 4]
+    learning_rate: [8.0e-6, 3.0e-5]
+    per_device_train_batch_size: [8, 16]
+    weight_decay: [0.01, 0.1]
+    warmup_ratio: [0.05, 0.2]
+    label_smoothing_factor: [0.03, 0.15]
+
+eval:
+  save_dir: "outputs/metrics/deberta_full"
+  batch_size: 32
