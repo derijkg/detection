@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 from src.utils.config import Config
 from src.utils.seed import set_seed
 from src.utils.logger import setup_logger
-from src.models.factory import ModelFactory
+from src.models.old.factory import ModelFactory
 from src.data.data_loader import DetectionDataManager
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)

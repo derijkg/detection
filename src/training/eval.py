@@ -9,7 +9,7 @@ import pandas as pd
 from src.utils.config import Config
 from src.utils.seed import set_seed
 from src.utils.logger import setup_logger
-from src.models.factory import ModelFactory
+from src.models.old.factory import ModelFactory
 from src.training.metrics import compute_classification_metrics
 from src.utils.plotting import plot_4panel_evaluation, plot_partial_sensitivity
 from src.utils.paper_reporter import generate_results_latex_table

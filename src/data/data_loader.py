@@ -1,4 +1,4 @@
-# detection/src/data/data_loader.py
+# src/data/data_loader.py
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -6,9 +6,10 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 import pandas as pd
 import numpy as np
 
-# Dynamically calculate project root (~/detection or E:\code\dta\detection)
+# Calculate project root dynamically (~/detection)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data_static" / "preprocessed" / "preprocessed_dataset.parquet"
+DEFAULT_FEATURES_DIR = PROJECT_ROOT / "data_static" / "model_features"
 
 # PyTorch import safeguard
 try:
@@ -21,10 +22,17 @@ except ImportError:
 
 # Hugging Face Datasets import safeguard
 try:
-    from datasets import Dataset as HFDataset, DatasetDict
+    from datasets import Dataset as HFDataset, DatasetDict, load_from_disk
     HAS_HF = True
 except ImportError:
     HAS_HF = False
+
+# Hugging Face Transformers import safeguard
+try:
+    from transformers import AutoTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
 
 
 @dataclass
@@ -105,8 +113,14 @@ if HAS_TORCH:
 
 
 class DetectionDataManager:
-    def __init__(self, data_path: Optional[Union[str, Path]] = None):
+    def __init__(
+        self, 
+        data_path: Optional[Union[str, Path]] = None, 
+        features_dir: Optional[Union[str, Path]] = None
+    ):
         self.data_path = Path(data_path) if data_path else DEFAULT_DATA_PATH
+        self.features_dir = Path(features_dir) if features_dir else DEFAULT_FEATURES_DIR
+
         if not self.data_path.exists():
             raise FileNotFoundError(f"Preprocessed dataset not found at: {self.data_path}")
         
@@ -127,7 +141,10 @@ class DetectionDataManager:
         df = self._df.copy()
 
         if filter_config.splits:
-            df = df[df['split'].isin(filter_config.splits)]
+            requested_splits = set(filter_config.splits)
+            if 'dev' in requested_splits or 'val' in requested_splits:
+                requested_splits.update(['dev', 'val'])
+            df = df[df['split'].isin(requested_splits)]
             
         if filter_config.scopes:
             normalized_scopes = []
@@ -186,3 +203,99 @@ class DetectionDataManager:
             return DatasetDict(dataset_dict)
         else:
             return HFDataset.from_pandas(filtered_df, preserve_index=False)
+
+    def get_tokenized_dataset(
+        self,
+        scope: str,
+        split: str,
+        tokenizer: Optional[Union[str, Any]] = "microsoft/mdeberta-v3-base",
+        max_length: int = 512,
+        padding: Union[bool, str] = "max_length",
+        model_prefix: str = "deberta",
+        force_reprocess: bool = False,
+        return_format: Optional[str] = "torch",
+    ):
+        if not HAS_HF:
+            raise ImportError("Hugging Face `datasets` library required.")
+
+        cache_dir = self.features_dir / f"{model_prefix}_{scope}" / f"{split}_tokenized"
+
+        # Load from disk if present
+        if cache_dir.exists() and any(cache_dir.iterdir()) and not force_reprocess:
+            print(f"[Cache Hit] Loading pretokenized dataset: {cache_dir}")
+            ds = load_from_disk(str(cache_dir))
+            if return_format and HAS_TORCH:
+                ds.set_format(type=return_format)
+            return ds
+
+        print(f"[Cache Miss] Pretokenizing split [{scope} | {split}]...")
+
+        # Get filtered dataset
+        split_query = [split]
+        if split in ["dev", "val"]:
+            split_query = ["dev", "val"]
+
+        hf_ds = self.get_hf_dataset(DataFilter(splits=split_query, scopes=[scope]))
+        if len(hf_ds) == 0:
+            raise ValueError(f"No samples found for scope='{scope}' and split='{split}'.")
+
+        # Resolve tokenizer
+        if isinstance(tokenizer, str):
+            if not HAS_TRANSFORMERS:
+                raise ImportError("`transformers` library required to load tokenizer by name.")
+            tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
+        elif tokenizer is not None:
+            tokenizer_obj = tokenizer
+        else:
+            raise ValueError("Must provide tokenizer instance or name.")
+
+        # Map tokenization
+        def _tokenize_fn(batch):
+            return tokenizer_obj(
+                batch["text"],
+                padding=padding,
+                truncation=True,
+                max_length=max_length
+            )
+
+        tokenized_ds = hf_ds.map(
+            _tokenize_fn,
+            batched=True,
+            desc=f"Tokenizing {model_prefix}_{scope}/{split}_tokenized"
+        )
+
+        # Save pretokenized cache to disk
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tokenized_ds.save_to_disk(str(cache_dir))
+        print(f"[Saved Cache] Tokenized dataset saved to: {cache_dir}")
+
+        if return_format and HAS_TORCH:
+            tokenized_ds.set_format(type=return_format)
+
+        return tokenized_ds
+
+    def build_all_tokenized_caches(
+        self,
+        scopes: List[str] = ["full", "sentence"],
+        splits: List[str] = ["train", "dev", "test"],
+        tokenizer: Union[str, Any] = "microsoft/mdeberta-v3-base",
+        max_length: int = 512,
+        model_prefix: str = "deberta",
+        force_reprocess: bool = False
+    ) -> Dict[str, Any]:
+        tokenized_dict = {}
+        for scope in scopes:
+            for split in splits:
+                try:
+                    key = f"{scope}_{split}"
+                    tokenized_dict[key] = self.get_tokenized_dataset(
+                        scope=scope,
+                        split=split,
+                        tokenizer=tokenizer,
+                        max_length=max_length,
+                        model_prefix=model_prefix,
+                        force_reprocess=force_reprocess
+                    )
+                except ValueError as e:
+                    print(f"Skipping ({scope}, {split}): {e}")
+        return tokenized_dict
