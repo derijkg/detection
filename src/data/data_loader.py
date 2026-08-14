@@ -6,6 +6,10 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 import pandas as pd
 import numpy as np
 
+# Dynamically calculate project root (~/detection or E:\code\dta\detection)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data_static" / "preprocessed" / "preprocessed_dataset.parquet"
+
 # PyTorch import safeguard
 try:
     import torch
@@ -13,7 +17,7 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-    TorchDataset = object  # Fallback type
+    TorchDataset = object
 
 # Hugging Face Datasets import safeguard
 try:
@@ -23,13 +27,8 @@ except ImportError:
     HAS_HF = False
 
 
-# =============================================================================
-# 1. DATACLASS STRUCTURES
-# =============================================================================
-
 @dataclass
 class TextSample:
-    """Dataclass representing a single text sample in the benchmark."""
     id: str
     text: str
     label: int
@@ -44,7 +43,6 @@ class TextSample:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TextSample":
-        """Factory method to construct a TextSample from a DataFrame row dict."""
         return cls(
             id=str(d.get("_id", d.get("id", ""))),
             text=str(d.get("text", "")),
@@ -60,34 +58,22 @@ class TextSample:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Converts sample back to a standard Python dictionary."""
         return asdict(self)
 
 
 @dataclass
 class DataFilter:
-    """Dataclass to specify filtering criteria for dataset slicing."""
-    splits: Optional[List[str]] = None            # e.g., ['train'], ['dev'], ['test']
-    scopes: Optional[List[str]] = None            # e.g., ['full'], ['single']
-    generation_types: Optional[List[str]] = None  # e.g., ['human_full', 'full_rewrite', 'synthetic_partial']
-    model_names: Optional[List[str]] = None       # e.g., ['qwen3.6:27b', 'gemma4:e4b', 'human']
-    llm_ratios: Optional[List[float]] = None      # e.g., [0.0, 1.0] or [0.25, 0.50, 0.75]
-    labels: Optional[List[int]] = None            # e.g., [0, 1]
+    splits: Optional[List[str]] = None
+    scopes: Optional[List[str]] = None
+    generation_types: Optional[List[str]] = None
+    model_names: Optional[List[str]] = None
+    llm_ratios: Optional[List[float]] = None
+    labels: Optional[List[int]] = None
 
-
-# =============================================================================
-# 2. PYTORCH DATASET WRAPPER
-# =============================================================================
 
 if HAS_TORCH:
     class PyTorchDetectionDataset(TorchDataset):
-        """PyTorch Dataset wrapper for TextSample dataclass instances."""
-        def __init__(
-            self, 
-            samples: List[TextSample], 
-            tokenizer: Optional[Any] = None, 
-            max_length: int = 512
-        ):
+        def __init__(self, samples: List[TextSample], tokenizer: Optional[Any] = None, max_length: int = 256):
             self.samples = samples
             self.tokenizer = tokenizer
             self.max_length = max_length
@@ -110,55 +96,25 @@ if HAS_TORCH:
 
             if self.tokenizer is not None:
                 encoded = self.tokenizer(
-                    sample.text,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=self.max_length,
-                    return_tensors="pt"
+                    sample.text, padding="max_length", truncation=True, 
+                    max_length=self.max_length, return_tensors="pt"
                 )
                 item["input_ids"] = encoded["input_ids"].squeeze(0)
                 item["attention_mask"] = encoded["attention_mask"].squeeze(0)
-                if "token_type_ids" in encoded:
-                    item["token_type_ids"] = encoded["token_type_ids"].squeeze(0)
-
             return item
 
 
-# =============================================================================
-# 3. BENCHMARK DATA MANAGER & LOADERS
-# =============================================================================
-
 class DetectionDataManager:
-    """
-    Manager class for the preprocessed detection benchmark dataset.
-    Loads data and produces scikit-learn tuples, PyTorch Datasets, 
-    Hugging Face DatasetDicts, or lists of typed TextSample objects.
-    """
-    DEFAULT_PATH = Path("/home/gderijck/detection/data/preprocessed/preprocessed_dataset.parquet")
-
     def __init__(self, data_path: Optional[Union[str, Path]] = None):
-        self.data_path = Path(data_path) if data_path else self.DEFAULT_PATH
+        self.data_path = Path(data_path) if data_path else DEFAULT_DATA_PATH
         if not self.data_path.exists():
             raise FileNotFoundError(f"Preprocessed dataset not found at: {self.data_path}")
         
-        # Read dataset into memory
         self._df = pd.read_parquet(self.data_path)
 
     @property
     def raw_dataframe(self) -> pd.DataFrame:
-        """Returns the full raw pandas DataFrame."""
         return self._df
-
-    def summary(self) -> None:
-        """Prints a quick breakdown of available splits, scopes, and generation types."""
-        print("=== Benchmark Dataset Summary ===")
-        print(f"Total Samples: {len(self._df)}")
-        print("\nSamples per Split:")
-        print(self._df['split'].value_counts())
-        print("\nSamples per Generation Type:")
-        print(self._df['generation_type'].value_counts())
-        print("\nSamples per Scope:")
-        print(self._df['scope'].value_counts())
 
     def filter_dataframe(self, filter_config: Optional[DataFilter] = None, sample_size: int = -1, seed: int = 42, **kwargs) -> pd.DataFrame:
         if filter_config is None:
@@ -173,7 +129,6 @@ class DetectionDataManager:
         if filter_config.splits:
             df = df[df['split'].isin(filter_config.splits)]
             
-        # --- Normalize 'sentence' and 'single' as automatic synonyms ---
         if filter_config.scopes:
             normalized_scopes = []
             for s in filter_config.scopes:
@@ -211,46 +166,18 @@ class DetectionDataManager:
         return df
 
     def get_samples(self, filter_config: Optional[DataFilter] = None, **kwargs) -> List[TextSample]:
-        """
-        Retrieves filtered data as a list of typed TextSample dataclass objects.
-        """
         filtered_df = self.filter_dataframe(filter_config, **kwargs)
         return [TextSample.from_dict(row) for row in filtered_df.to_dict(orient="records")]
 
     def get_sklearn_data(self, filter_config: Optional[DataFilter] = None, **kwargs) -> Tuple[List[str], List[int]]:
-        """
-        Extracts (X_text, y_labels) tuple suitable for scikit-learn classifiers (e.g. SVM).
-        """
         filtered_df = self.filter_dataframe(filter_config, **kwargs)
-        X = filtered_df['text'].tolist()
-        y = filtered_df['label'].tolist()
-        return X, y
-
-    def get_pytorch_dataset(
-        self, 
-        filter_config: Optional[DataFilter] = None, 
-        tokenizer: Optional[Any] = None, 
-        max_length: int = 512,
-        **kwargs
-    ):
-        """
-        Returns a PyTorch Dataset instance over the filtered samples.
-        """
-        if not HAS_TORCH:
-            raise ImportError("PyTorch is required for `get_pytorch_dataset()`. Please install `torch`.")
-        samples = self.get_samples(filter_config, **kwargs)
-        return PyTorchDetectionDataset(samples, tokenizer=tokenizer, max_length=max_length)
+        return filtered_df['text'].tolist(), filtered_df['label'].tolist()
 
     def get_hf_dataset(self, filter_config: Optional[DataFilter] = None, **kwargs):
-        """
-        Returns a Hugging Face Dataset or DatasetDict.
-        """
         if not HAS_HF:
-            raise ImportError("Hugging Face `datasets` library is required for `get_hf_dataset()`.")
-        
+            raise ImportError("Hugging Face `datasets` library required.")
         filtered_df = self.filter_dataframe(filter_config, **kwargs)
         
-        # If no explicit split was passed in filter, return DatasetDict grouped by split
         if filter_config is None or filter_config.splits is None:
             dataset_dict = {}
             for split_name in filtered_df['split'].unique():

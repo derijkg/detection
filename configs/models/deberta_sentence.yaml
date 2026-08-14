@@ -6,7 +6,7 @@ model:
 
 training:
   output_dir: "outputs/checkpoints/deberta_single"
-  train_sample_size: -1
+  train_sample_size: 100000
   num_train_epochs: 3
   per_device_train_batch_size: 16
   per_device_eval_batch_size: 16
@@ -18,7 +18,7 @@ training:
 optuna:
   n_trials: 10
   output_dir: "outputs/metrics/deberta_single_optuna"
-  tune_sample_size: 1000
+  tune_sample_size: 3000
   score_metric: "pauc"
   max_fpr: 0.01
 

@@ -25,38 +25,12 @@ from src.utils.plotting import plot_4panel_evaluation, plot_partial_sensitivity
 from src.training.tuner import run_tuning
 from src.data.data_loader import DetectionDataManager
 
-UNIFIED_METRICS_DIR = Path("/home/gderijck/detection/outputs/metrics")
-
-
-def resolve_config_path(model_name: str, scope: str = "") -> Path:
-    """
-    Looks for scope-specific config (e.g. configs/models/svm_sentence.yaml)
-    first, and falls back to model-level config (e.g. configs/models/svm.yaml).
-    """
-    candidates = []
-    if scope:
-        candidates.append(Path(f"configs/models/{model_name}_{scope}.yaml"))
-        if scope in ['sentence', 'single']:
-            candidates.append(Path(f"configs/models/{model_name}_sentence.yaml"))
-            candidates.append(Path(f"configs/models/{model_name}_single.yaml"))
-        elif scope == 'full':
-            candidates.append(Path(f"configs/models/{model_name}_full.yaml"))
-
-    candidates.append(Path(f"configs/models/{model_name}.yaml"))
-
-    for cand in candidates:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError(
-        f"Could not find config file for model '{model_name}' (scope='{scope}'). "
-        f"Checked paths: {[str(c) for c in candidates]}"
-    )
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+UNIFIED_METRICS_DIR = PROJECT_ROOT / "outputs" / "metrics"
 
 def run_experiment(model_name: str, scope: str, tune: bool, seed: int, logger) -> Dict[str, Any]:
     """Runs tuning (optional), training, and evaluation for a (model_name, scope) pair."""
-    config_path = resolve_config_path(model_name, scope)
+    config_path = Config.resolve_config_path(model_name, scope)
     logger.info(f"Using config file: '{config_path}'")
     
     cfg = Config.from_yaml(str(config_path))
@@ -151,7 +125,6 @@ def run_experiment(model_name: str, scope: str, tune: bool, seed: int, logger) -
 
 
 def compile_unified_reports(results: List[Dict[str, Any]], logger) -> None:
-    """Consolidates results into CSV, JSON, and LaTeX paper tables."""
     UNIFIED_METRICS_DIR.mkdir(parents=True, exist_ok=True)
     results_df = pd.DataFrame(results)
 

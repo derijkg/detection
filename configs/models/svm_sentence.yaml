@@ -37,7 +37,7 @@ training:
 optuna:
   n_trials: 30
   output_dir: "outputs/metrics/svm_sentence_optuna"
-  tune_sample_size: 1000
+  tune_sample_size: 9000
   score_metric: "pauc"
   max_fpr: 0.01
 

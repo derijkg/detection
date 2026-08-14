@@ -18,10 +18,6 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def suggest_float_log(trial: optuna.Trial, name: str, bounds: List[float], default_log: bool = True) -> float:
-    """
-    Safely samples floating point hyperparameters. 
-    Enforces log=True for multiplicative parameters only if low bound > 0.
-    """
     low, high = float(bounds[0]), float(bounds[1])
     use_log = default_log and (low > 0)
     return trial.suggest_float(name, low, high, log=use_log)
@@ -31,11 +27,8 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
                      model_name: str, search_space: Dict[str, Any], cfg: Config, logger: Any) -> float:
     training_params = vars(cfg.training).copy()
 
-    # =========================================================================
-    # 1. DEBERTA / TRANSFORMER HYPERPARAMETER SAMPLING
-    # =========================================================================
+    # 1. DEBERTA / TRANSFORMER SAMPLING
     if model_name.lower() in ["deberta", "mdeberta", "mdeberta-v3"]:
-        # Additive / Count parameters (Linear Scale)
         if "num_train_epochs" in search_space:
             training_params["num_train_epochs"] = trial.suggest_int(
                 "num_train_epochs", search_space["num_train_epochs"][0], search_space["num_train_epochs"][1]
@@ -46,7 +39,6 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
                 "per_device_train_batch_size", search_space["per_device_train_batch_size"]
             )
 
-        # Multiplicative parameters (Log Scale)
         if "learning_rate" in search_space:
             training_params["learning_rate"] = suggest_float_log(
                 trial, "learning_rate", search_space["learning_rate"], default_log=True
@@ -57,7 +49,6 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
                 trial, "weight_decay", search_space["weight_decay"], default_log=True
             )
 
-        # Ratio / Probability parameters (Linear Scale)
         if "warmup_ratio" in search_space:
             training_params["warmup_ratio"] = suggest_float_log(
                 trial, "warmup_ratio", search_space["warmup_ratio"], default_log=False
@@ -68,35 +59,28 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
                 trial, "label_smoothing_factor", search_space["label_smoothing_factor"], default_log=False
             )
 
-        training_params["output_dir"] = f"/home/gderijck/detection/outputs/checkpoints/trial_{trial.number}"
+        training_params["output_dir"] = f"outputs/checkpoints/trial_{trial.number}"
 
-    # =========================================================================
-    # 2. SVM HYPERPARAMETER SAMPLING
-    # =========================================================================
+    # 2. SVM SAMPLING
     elif model_name.lower() in ["svm", "linear_svm"]:
-        # Regularization strength C (Multiplicative -> Log Scale)
         if "C" in search_space:
             training_params["C"] = suggest_float_log(
                 trial, "C", search_space["C"], default_log=True
             )
 
-        # Categorical Kernel selection
         kernel = trial.suggest_categorical("kernel", search_space.get("kernel", ["linear"]))
         training_params["kernel"] = kernel
 
-        # Kernel bandwidth gamma for non-linear SVM (Multiplicative -> Log Scale)
         if kernel in ["rbf", "sigmoid"] and "gamma" in search_space:
             training_params["gamma"] = suggest_float_log(
                 trial, "gamma", search_space["gamma"], default_log=True
             )
 
-        # Stylometric subspace weight multiplier (Multiplicative -> Log Scale)
         if "sty_weight" in search_space:
             training_params["sty_weight"] = suggest_float_log(
                 trial, "sty_weight", search_space["sty_weight"], default_log=True
             )
 
-        # Class imbalance weighting (Multiplicative -> Log Scale)
         weight_mode = trial.suggest_categorical("weight_mode", search_space.get("weight_mode", ["balanced"]))
         if weight_mode == "custom" and "human_class_weight" in search_space:
             human_w = suggest_float_log(
@@ -108,9 +92,7 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
 
         training_params["use_stylometrics"] = True
 
-    # =========================================================================
-    # 3. MODEL TRAINING & EVALUATION METRIC EXTRACTION
-    # =========================================================================
+    # 3. MODEL TRAINING & SCORE EXTRACTION
     detector = ModelFactory.create(model_name, granularity=getattr(cfg.model, "granularity", "full"))
     eval_metrics = detector.train(train_samples, val_samples, training_params)
 
@@ -120,7 +102,7 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
         val_score = eval_metrics.get("TPR @ 1% FPR", eval_metrics.get("ROC-AUC", eval_metrics.get("eval_roc_auc", 0.5)))
     elif "f1" in score_metric:
         val_score = eval_metrics.get("F1-Score", eval_metrics.get("eval_f1", 0.5))
-    else:  # Default to ROC-AUC
+    else:
         val_score = eval_metrics.get("ROC-AUC", eval_metrics.get("eval_roc_auc", 0.5))
 
     logger.info(f"Trial #{trial.number} Finished | {score_metric.upper()} Score: {val_score:.4f}")
@@ -134,15 +116,20 @@ def optuna_objective(trial: optuna.Trial, train_samples: Any, val_samples: Any,
 
 
 def run_tuning(model_name: str, scope: str, seed: int = 42) -> str:
-    config_path = f"configs/models/{model_name}.yaml"
-    cfg = Config.from_yaml(config_path)
+    """Runs Optuna hyperparameter search and saves best parameters to a scope-isolated JSON file."""
+    config_path = Config.resolve_config_path(model_name, scope)
+    cfg = Config.from_yaml(str(config_path))
     cfg.model.granularity = scope
 
     set_seed(seed)
     logger = setup_logger(name="tuner", log_file=f"tuner_{model_name}_{scope}.log")
 
+    optuna_out_dir = f"outputs/metrics/{model_name}_{scope}_optuna"
+    os.makedirs(optuna_out_dir, exist_ok=True)
+    best_json_path = os.path.join(optuna_out_dir, "best_hyperparameters.json")
+
     tune_size = getattr(cfg.optuna, "tune_sample_size", 1000)
-    logger.info(f"Starting Optuna search for '{model_name}' ({scope}) | Tune Sample Size: {tune_size}...")
+    logger.info(f"Starting Optuna search for '{model_name}' ({scope}) | Config: '{config_path}' | Tune Size: {tune_size}...")
 
     data_mgr = DetectionDataManager()
 
@@ -162,19 +149,15 @@ def run_tuning(model_name: str, scope: str, seed: int = 42) -> str:
 
     study = optuna.create_study(direction="maximize")
 
-    # --- ENQUEUE KNOWN BEST PARAMETERS AS TRIAL #0 ---
+    # ENQUEUE INITIAL TRIAL
     if cfg.optuna.enqueue_params:
-        logger.info(f"Enqueueing initial warmstart trial parameters: {cfg.optuna.enqueue_params}")
+        logger.info(f"Enqueueing warmstart trial parameters: {cfg.optuna.enqueue_params}")
         study.enqueue_trial(cfg.optuna.enqueue_params)
 
     study.optimize(
         lambda trial: optuna_objective(trial, train_ds, val_ds, model_name, cfg.optuna.search_space, cfg, logger),
         n_trials=cfg.optuna.n_trials
     )
-
-    optuna_out_dir = f"outputs/metrics/{model_name}_{scope}_optuna"
-    os.makedirs(optuna_out_dir, exist_ok=True)
-    best_json_path = os.path.join(optuna_out_dir, "best_hyperparameters.json")
 
     best_data = {
         "model": model_name,
@@ -198,13 +181,18 @@ def run_tuning(model_name: str, scope: str, seed: int = 42) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Optuna Hyperparameter Search")
-    parser.add_argument("--config", type=str, default="configs/models/deberta.yaml", help="Path to config file")
-    parser.add_argument("--scope", type=str, default="full", choices=["full", "single"], help="Text scope ('full' or 'single')")
+    parser.add_argument("--config", type=str, default=None, help="Optional path to config file")
+    parser.add_argument("--model", type=str, default="deberta", help="Model name ('deberta', 'svm')")
+    parser.add_argument("--scope", type=str, default="full", choices=["full", "sentence"], help="Scope ('full', 'sentence')")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    cfg = Config.from_yaml(args.config)
-    run_tuning(cfg.model.name, args.scope, args.seed)
+    model_name = args.model
+    if args.config:
+        cfg = Config.from_yaml(args.config)
+        model_name = cfg.model.name
+
+    run_tuning(model_name, args.scope, args.seed)
 
 
 if __name__ == "__main__":

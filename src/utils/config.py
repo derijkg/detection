@@ -2,6 +2,7 @@
 
 import os
 import yaml
+from pathlib import Path
 from dataclasses import dataclass, field, fields
 from typing import Dict, Any, Optional
 
@@ -62,6 +63,35 @@ class Config:
         self.training = TrainingConfig(**filter_dataclass_kwargs(TrainingConfig, config_dict.get("training", {})))
         self.optuna = OptunaConfig(**filter_dataclass_kwargs(OptunaConfig, config_dict.get("optuna", {})))
         self.eval = EvalConfig(**filter_dataclass_kwargs(EvalConfig, config_dict.get("eval", {})))
+
+    @classmethod
+    def resolve_config_path(cls, model_name: str, scope: str = "") -> Path:
+        """
+        Dynamically resolves path to a config file. Checks scope-specific configs 
+        first (e.g., configs/models/svm_sentence.yaml), then falls back to model-level config.
+        """
+        project_root = Path(__file__).resolve().parent.parent.parent
+        base_dir = project_root / "configs" / "models"
+        
+        candidates = []
+        if scope:
+            candidates.append(base_dir / f"{model_name}_{scope}.yaml")
+            if scope in ['sentence', 'single']:
+                candidates.append(base_dir / f"{model_name}_sentence.yaml")
+                candidates.append(base_dir / f"{model_name}_single.yaml")
+            elif scope == 'full':
+                candidates.append(base_dir / f"{model_name}_full.yaml")
+
+        candidates.append(base_dir / f"{model_name}.yaml")
+
+        for cand in candidates:
+            if cand.exists():
+                return cand
+
+        raise FileNotFoundError(
+            f"Could not find config file for model '{model_name}' (scope='{scope}'). "
+            f"Checked paths: {[str(c) for c in candidates]}"
+        )
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "Config":

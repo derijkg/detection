@@ -22,7 +22,9 @@ from sklearn.metrics import roc_curve
 from src.models.base_model import BaseDetector
 from src.training.metrics import compute_classification_metrics
 
-FEATURE_CACHE_DIR = Path("/home/gderijck/detection/data/model_features")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+FEATURE_CACHE_DIR = PROJECT_ROOT / "data_static" / "model_features"
+
 DUTCH_TRANSITIONS = {
     "echter", "bovendien", "daarnaast", "desalniettemin", "kortom",
     "tevens", "daardoor", "derhalve", "bijgevolg", "namelijk"
@@ -30,11 +32,12 @@ DUTCH_TRANSITIONS = {
 
 
 # =============================================================================
-# FEATURE EXTRACTION TRANSFORMERS
+# FEATURE EXTRACTION TRANSFORMERS WITH FITTED ATTRIBUTES
 # =============================================================================
 
 class TextExtractor(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
+        self.fitted_ = True
         return self
 
     def transform(self, X):
@@ -55,6 +58,7 @@ class StylometricExtractor(BaseEstimator, TransformerMixin):
         self.granularity = granularity
 
     def fit(self, X, y=None):
+        self.fitted_ = True
         return self
 
     def _extract_single(self, text: str) -> np.ndarray:
@@ -62,7 +66,7 @@ class StylometricExtractor(BaseEstimator, TransformerMixin):
         total_chars = max(1, len(text))
 
         if not words:
-            num_features = 8 if self.granularity == 'single' else 11
+            num_features = 8 if self.granularity in ['single', 'sentence'] else 11
             return np.zeros(num_features)
 
         word_lengths = [len(w) for w in words]
@@ -95,7 +99,7 @@ class StylometricExtractor(BaseEstimator, TransformerMixin):
             punc_ratio
         ]
 
-        if self.granularity == 'single':
+        if self.granularity in ['single', 'sentence']:
             return np.array(base_features)
 
         sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
@@ -125,6 +129,7 @@ class StylometricScaler(BaseEstimator, TransformerMixin):
         self.weight = weight
 
     def fit(self, X, y=None):
+        self.fitted_ = True
         return self
 
     def transform(self, X):
@@ -145,7 +150,7 @@ class SVMDetector(BaseDetector):
         self.optimal_threshold: float = 0.5
 
     def _build_feature_pipeline(self, params: Dict[str, Any]) -> Pipeline:
-        default_max_df = 1.0 if self.granularity == 'single' else 0.95
+        default_max_df = 1.0 if self.granularity in ['single', 'sentence'] else 0.95
 
         w_params = {
             'ngram_range': (params.get('word_min_ngram', 1), params.get('word_max_ngram', 3)),
@@ -188,18 +193,31 @@ class SVMDetector(BaseDetector):
         return Pipeline([('union', FeatureUnion(transformers)), ('normalizer', Normalizer(norm='l2'))])
 
     def _get_or_compute_features(self, X: List[str], split_name: str, params: Dict[str, Any]) -> Any:
-        """Loads cached feature matrix from disk or computes and saves it if missing."""
         cache_folder = FEATURE_CACHE_DIR / f"svm_{self.granularity}"
         cache_folder.mkdir(parents=True, exist_ok=True)
-        cache_file = cache_folder / f"{split_name}_features.joblib"
+        
+        n_samples = len(X)
+        cache_file = cache_folder / f"{split_name}_{n_samples}_features.joblib"
+        legacy_cache_file = cache_folder / f"{split_name}_features.joblib"
 
+        # Check size-specific cache first
         if cache_file.exists():
-            print(f"-> [FEATURE CACHE HIT] Loading '{split_name}' features from: {cache_file}")
+            print(f"-> [FEATURE CACHE HIT] Loading '{split_name}' features ({n_samples} samples) from: {cache_file}")
             cached_data = joblib.load(cache_file)
             self.feature_pipeline = cached_data['pipeline']
             return cached_data['X_feats']
+        
+        # Check legacy cache file with length validation
+        if legacy_cache_file.exists():
+            cached_data = joblib.load(legacy_cache_file)
+            if cached_data['X_feats'].shape[0] == n_samples:
+                print(f"-> [FEATURE CACHE HIT] Loading legacy '{split_name}' features ({n_samples} samples) from: {legacy_cache_file}")
+                self.feature_pipeline = cached_data['pipeline']
+                return cached_data['X_feats']
+            else:
+                print(f"-> [FEATURE CACHE MISMATCH] Legacy '{split_name}' feature size ({cached_data['X_feats'].shape[0]}) != input size ({n_samples}). Recomputing...")
 
-        print(f"-> [FEATURE CACHE MISS] Extracting '{split_name}' features for scope '{self.granularity}'...")
+        print(f"-> [FEATURE CACHE MISS] Extracting '{split_name}' features ({n_samples} samples) for scope '{self.granularity}'...")
         if self.feature_pipeline is None or split_name == "train":
             self.feature_pipeline = self._build_feature_pipeline(params)
             X_feats = self.feature_pipeline.fit_transform(X)
@@ -211,7 +229,6 @@ class SVMDetector(BaseDetector):
         return X_feats
 
     def _compute_oof_optimal_threshold(self, X_feats: Any, y_train: np.ndarray, doc_ids: Optional[np.ndarray]) -> float:
-        """Calculates optimal decision threshold using Out-Of-Fold CV on training set (FPR <= 1%)."""
         print("Calculating Out-Of-Fold (OOF) cross-validation predictions for optimal operating point...")
         
         if doc_ids is None or len(np.unique(doc_ids)) < 2:
@@ -241,7 +258,6 @@ class SVMDetector(BaseDetector):
         return optimal_thresh
 
     def train(self, train_ds: Any, val_ds: Any, training_args_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Extracts/loads features, computes OOF threshold, and trains final model on 100% train data."""
         if hasattr(train_ds, 'to_pandas'):
             train_df = train_ds.to_pandas()
             X_train, y_train = train_df['text'].tolist(), train_df['label'].values
@@ -329,7 +345,6 @@ class SVMDetector(BaseDetector):
     def load(self, input_dir: str) -> None:
         load_path = os.path.join(input_dir, "svm_model_bundle.joblib") if os.path.isdir(input_dir) else input_dir
         if not os.path.exists(load_path):
-            # Fallback check for old pkl format
             load_path = os.path.join(input_dir, "svm_pipeline.pkl") if os.path.isdir(input_dir) else input_dir
 
         if not os.path.exists(load_path):
@@ -342,7 +357,6 @@ class SVMDetector(BaseDetector):
             self.optimal_threshold = loaded.get('optimal_threshold', 0.5)
             self.granularity = loaded.get('granularity', 'full')
         else:
-            # Direct pipeline fallback
             self.feature_pipeline = loaded.named_steps['features']
             self.classifier = loaded.named_steps['classifier']
             self.optimal_threshold = getattr(loaded, 'optimal_threshold', 0.5)

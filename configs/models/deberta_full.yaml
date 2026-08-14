@@ -18,7 +18,7 @@ training:
 optuna:
   n_trials: 10
   output_dir: "outputs/metrics/deberta_full_optuna"
-  tune_sample_size: 1000
+  tune_sample_size: 1500
   score_metric: "pauc"
   max_fpr: 0.01
 

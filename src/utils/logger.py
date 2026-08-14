@@ -2,10 +2,12 @@
 
 import sys
 import logging
-from pathlib import Path
 from typing import Optional, Union
 
-DEFAULT_LOG_DIR = Path("/home/gderijck/detection/outputs/logs")
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_LOG_DIR = PROJECT_ROOT / "outputs" / "logs"
 
 
 def setup_logger(
