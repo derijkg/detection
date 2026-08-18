@@ -17,7 +17,7 @@ from sklearn.metrics import (
 # Configuration
 # ============================================================
 
-INPUT_FILE = "/home/gderijck/detection/outputs/svm/sentence/test_predictions.csv"
+INPUT_FILE = "/home/gderijck/detection/outputs/fastdetectgpt_nl/sentence/test_predictions.csv"
 OUTPUT_FILE = "binary_classification_metrics.tex"
 
 # Only evaluate the test split

@@ -45,6 +45,7 @@ def _ensure_sliceable_X(X):
 
 
 def load_best_svm_hyperparameters(scope: str, outputs_dir: Path) -> dict:
+    """Loads tuned hyperparameters from outputs/svm/<scope>/best_hyperparameters.json."""
     config_path = outputs_dir / "svm" / scope / "best_hyperparameters.json"
     if not config_path.exists():
         print(f"[WARNING] No tuned parameters found at '{config_path}'. Using default C=1.0.")
@@ -138,7 +139,7 @@ def calculate_optimal_threshold_on_dev(model, dev_data, max_fpr=0.01):
 
 
 def evaluate_and_plot_results(
-    split_data, df_raw, split_name, scope, model, optimal_threshold, save_dir
+    split_data, df_raw, split_name, scope, model, optimal_threshold, save_dir, left_out_model=None
 ):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +176,7 @@ def evaluate_and_plot_results(
     metrics_summary = {
         "Scope": scope,
         "Split": split_name,
+        "Left-Out Model": left_out_model if left_out_model else "None",
         "Total Samples": int(len(labels)),
         "Optimal Threshold (\u03c4*)": round(float(optimal_threshold), 6),
         "pAUC @ max FPR 0.01": round(pauc_001_val, 6),
@@ -189,10 +191,18 @@ def evaluate_and_plot_results(
     }
 
     print(f"\n--- PERFORMANCE SUMMARY [{split_name.upper()}] ---")
+    if left_out_model:
+        print(f"  Held-Out Generator          : {left_out_model}")
     for k, v in metrics_summary.items():
-        print(f"  {k:<28}: {v}")
+        if k != "Left-Out Model":
+            print(f"  {k:<28}: {v}")
 
-    gen_col = "model_name" if "model_name" in df_raw.columns else ("generator_model" if "generator_model" in df_raw.columns else None)
+    gen_col = None
+    for col in ["model_name", "generator_model", "model"]:
+        if col in df_raw.columns:
+            gen_col = col
+            break
+
     per_model_results = []
 
     if gen_col and len(df_raw) == len(labels):
@@ -206,6 +216,8 @@ def evaluate_and_plot_results(
         for generator in df_eval[gen_col].unique():
             if str(generator).lower() == "human":
                 continue
+
+            is_left_out = bool(left_out_model and str(generator).lower() == left_out_model.lower())
             llm_sub = df_eval[df_eval[gen_col] == generator]
             combined = pd.concat([human_df, llm_sub])
 
@@ -215,27 +227,33 @@ def evaluate_and_plot_results(
 
             sub_auc = float(roc_auc_score(sub_labels, sub_probs)) if len(np.unique(sub_labels)) > 1 else 0.0
             sub_acc = float(accuracy_score(sub_labels, sub_preds))
-            sub_prec, sub_rec, sub_f1, _ = precision_recall_fscore_support(sub_labels, sub_preds, average="binary", zero_division=0)
+            sub_prec, sub_rec, sub_f1, _ = precision_recall_fscore_support(
+                sub_labels, sub_preds, average="binary", zero_division=0
+            )
+
+            gen_display = f"{generator} (HELD-OUT)" if is_left_out else str(generator)
 
             per_model_results.append({
-                "Generator": str(generator),
+                "Generator": gen_display,
                 "LLM Samples": int(len(llm_sub)),
                 "ROC-AUC": round(sub_auc, 4),
                 "Accuracy": round(sub_acc, 4),
                 "F1-Score": round(float(sub_f1), 4),
                 "Precision": round(float(sub_prec), 4),
                 "Recall": round(float(sub_rec), 4),
+                "Is Held-Out": is_left_out,
             })
 
         if per_model_results:
             print("\n--- PER-GENERATOR BREAKDOWN ---")
             print(pd.DataFrame(per_model_results).to_string(index=False))
 
-    # Generate Plot
+    # Generate Plots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10), dpi=300)
     plt.subplots_adjust(wspace=0.25, hspace=0.3)
 
-    axes[0, 0].plot(fpr, tpr, color="#2b5c8f", lw=2, label=f"Linear SVM ({scope.upper()})\npAUC@0.01={pauc_001_val:.4f}")
+    label_suffix = f" (LOO: {left_out_model})" if left_out_model else ""
+    axes[0, 0].plot(fpr, tpr, color="#2b5c8f", lw=2, label=f"Linear SVM ({scope.upper()}){label_suffix}\npAUC@0.01={pauc_001_val:.4f}")
     axes[0, 0].axvline(x=0.01, color="red", linestyle=":", lw=1.5, label="FPR = 0.01")
     axes[0, 0].plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1.5, label="Random")
     axes[0, 0].set_xlabel("False Positive Rate", fontsize=11)
@@ -297,19 +315,20 @@ def evaluate_and_plot_results(
     print(f"[SAVED PLOT] Plot saved to: '{plot_path}'")
     plt.close()
 
-    # Save LaTeX
+    # Save LaTeX Table
     latex_table_path = save_dir / f"{split_name}_metrics_table.tex"
+    loo_tex_info = f" (Held-out: {left_out_model})" if left_out_model else ""
     with open(latex_table_path, "w") as f:
         f.write("% Auto-generated LaTeX table\n")
         f.write("\\begin{table}[htbp]\n\\centering\n")
-        f.write(f"\\caption{{SVM {split_name.capitalize()} Split Performance ({scope.upper()}). Threshold $\\tau^* = {optimal_threshold:.4f}$.}}\n")
+        f.write(f"\\caption{{SVM {split_name.capitalize()} Split Performance ({scope.upper()}){loo_tex_info}. Threshold $\\tau^* = {optimal_threshold:.4f}$.}}\n")
         f.write("\\label{tab:svm_" + scope + "_" + split_name + "}\n")
         f.write("\\begin{tabular}{lcccccc}\n\\hline\n")
         f.write("\\textbf{Split} & \\textbf{pAUC @ 0.01} & \\textbf{ROC-AUC} & \\textbf{Accuracy} & \\textbf{F1-Score} & \\textbf{Precision} & \\textbf{Recall} \\\\\n\\hline\n")
         f.write(f"{split_name.capitalize()} & {pauc_001_val:.4f} & {roc_auc_val:.4f} & {acc:.4f} & {f1:.4f} & {prec:.4f} & {rec:.4f} \\\\\n")
         f.write("\\hline\n\\end{tabular}\n\\end{table}\n")
 
-    # Save Logits
+    # Save Full Logits & Predictions (Full Data)
     if len(df_raw) == len(probs_llm):
         df_logits = df_raw.copy()
     else:
@@ -317,20 +336,20 @@ def evaluate_and_plot_results(
 
     df_logits["prob_llm"] = probs_llm
     df_logits["pred_llm"] = preds
+    if left_out_model and gen_col in df_logits.columns:
+        df_logits["is_held_out_generator"] = df_logits[gen_col].astype(str).str.lower() == left_out_model.lower()
 
     csv_path = save_dir / f"{split_name}_logits_analysis.csv"
     df_logits.to_csv(csv_path, index=False)
-    print(f"[SAVED LOGITS] Logits saved to: '{csv_path}'")
+    print(f"[SAVED LOGITS] Full prediction data saved to: '{csv_path}'")
 
     return metrics_summary, per_model_results
 
 
 def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager):
     outputs_base = Path(args.outputs_dir) if args.outputs_dir else DEFAULT_OUTPUTS_DIR
-    scope_dir = outputs_base / "svm" / scope
-    scope_dir.mkdir(parents=True, exist_ok=True)
-
     features_dir = Path(args.features_dir) if args.features_dir else DEFAULT_FEATURES_DIR / f"svm_{scope}"
+
     train_path = features_dir / "train.joblib"
     dev_path = features_dir / "dev.joblib"
     test_path = features_dir / "test.joblib"
@@ -338,7 +357,7 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
     if not train_path.exists() or not dev_path.exists() or not test_path.exists():
         raise FileNotFoundError(
             f"Pre-extracted features for scope '{scope}' missing at: {features_dir}.\n"
-            f"Please run 'python scripts/features_svm.py' first."
+            f"Please run feature extraction first."
         )
 
     # Determine scope-specific sample size
@@ -349,8 +368,78 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
     else:
         sample_size = args.sample_size
 
+    # Load Data and Features
+    train_data = joblib.load(train_path)
+    dev_data = joblib.load(dev_path)
+    test_data = joblib.load(test_path)
+
+    X_train = _ensure_sliceable_X(train_data["X"])
+    y_train = np.asarray(train_data["y"])
+    X_dev = _ensure_sliceable_X(dev_data["X"])
+    y_dev = np.asarray(dev_data["y"])
+    X_test = _ensure_sliceable_X(test_data["X"])
+    y_test = np.asarray(test_data["y"])
+
+    train_df = manager.filter_dataframe(DataFilter(splits=["train"], scopes=[scope]))
+    dev_df = manager.filter_dataframe(DataFilter(splits=["dev"], scopes=[scope]))
+    test_df = manager.filter_dataframe(DataFilter(splits=["test"], scopes=[scope]))
+
+    gen_col = None
+    for col in ["model_name", "generator_model", "model"]:
+        if col in train_df.columns:
+            gen_col = col
+            break
+
+    # Handle Leave-One-Out (LOO) setup if --loo is passed
+    left_out_model = None
+    if args.loo:
+        if gen_col is None:
+            raise ValueError("Cannot perform LOO filtering: Generator model column not found in dataframe.")
+
+        # Identify unique LLM generators (excluding human class)
+        all_generators = train_df[gen_col].dropna().unique()
+        llm_generators = sorted([str(g) for g in all_generators if str(g).lower() != "human"])
+
+        if args.loo.lower() == "random":
+            rng = np.random.default_rng(args.seed)
+            left_out_model = str(rng.choice(llm_generators))
+        else:
+            matched = [g for g in llm_generators if g.lower() == args.loo.lower()]
+            if matched:
+                left_out_model = matched[0]
+            else:
+                raise ValueError(
+                    f"Specified LOO model '{args.loo}' not found. Available LLM generators: {llm_generators}"
+                )
+
+        # Filter Left-Out Model out of TRAIN set
+        train_keep_mask = (train_df[gen_col].astype(str) != left_out_model).values
+        X_train = X_train[train_keep_mask]
+        y_train = y_train[train_keep_mask]
+        train_df = train_df[train_keep_mask].reset_index(drop=True)
+
+        # Filter Left-Out Model out of DEV set
+        dev_keep_mask = (dev_df[gen_col].astype(str) != left_out_model).values
+        X_dev = X_dev[dev_keep_mask]
+        y_dev = y_dev[dev_keep_mask]
+        dev_df = dev_df[dev_keep_mask].reset_index(drop=True)
+
+        # Configure Output Directory under outputs/svm_loo/
+        scope_dir = outputs_base / "svm_loo" / scope / left_out_model
+    else:
+        # Standard Output Directory under outputs/svm/
+        scope_dir = outputs_base / "svm" / scope
+
+    scope_dir.mkdir(parents=True, exist_ok=True)
+
+    dev_data = {"X": X_dev, "y": y_dev}
+    test_data = {"X": X_test, "y": y_test}
+
     print("\n" + "=" * 70)
     print(f" FULL LINEAR SVM TRAINING FOR SCOPE: '{scope.upper()}' ")
+    print(f" LOO Active       : {bool(args.loo)}")
+    if left_out_model:
+        print(f" Left-Out Model   : '{left_out_model}' (Excluded from TRAIN and DEV)")
     print(f" Features Dir    : {features_dir}")
     print(f" Balanced Split  : {args.balanced} (50% Human / 50% LLM)")
     print(f" Target Size     : {sample_size if sample_size > 0 else 'FULL Pre-extracted'}")
@@ -359,22 +448,7 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
 
     best_params = load_best_svm_hyperparameters(scope=scope, outputs_dir=outputs_base)
 
-    train_data = joblib.load(train_path)
-    dev_data = joblib.load(dev_path)
-    test_data = joblib.load(test_path)
-
-    X_train = _ensure_sliceable_X(train_data["X"])
-    y_train = np.asarray(train_data["y"])
-    dev_data["y"] = np.asarray(dev_data["y"])
-    test_data["y"] = np.asarray(test_data["y"])
-    
-    train_df = manager.filter_dataframe(DataFilter(splits=["train"], scopes=[scope]))
-    dev_df = manager.filter_dataframe(DataFilter(splits=["dev"], scopes=[scope]))
-    test_df = manager.filter_dataframe(DataFilter(splits=["test"], scopes=[scope]))
-
-    gen_col = "model_name" if "model_name" in train_df.columns else ("generator_model" if "generator_model" in train_df.columns else None)
-
-    # Balanced Subsampling / Standard Subsampling
+    # Balanced Subsampling / Standard Subsampling on Train Set
     if args.balanced or (sample_size > 0 and sample_size < X_train.shape[0]):
         human_idx = np.where(y_train == 0)[0]
         llm_idx = np.where(y_train == 1)[0]
@@ -405,7 +479,7 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
             if len(train_df) == len(train_data["y"]):
                 train_df = train_df.iloc[idx_tr].reset_index(drop=True)
 
-    # Print Sample Statistics & Model Type Breakdown
+    # Sample Statistics & Model Type Breakdown
     n_human = int((y_train == 0).sum())
     n_llm = int((y_train == 1).sum())
     total_samples = len(y_train)
@@ -418,19 +492,19 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
     print(f"   - LLM Samples   (1)  : {n_llm} ({n_llm / total_samples * 100:.1f}%)")
 
     if gen_col and len(train_df) == total_samples:
-        print("\n Model Type Breakdown:")
+        print("\n Training Model Breakdown:")
         breakdown = train_df[gen_col].value_counts()
         for model_type, count in breakdown.items():
             pct = count / total_samples * 100
             print(f"   - {str(model_type):<20}: {count:>6d} ({pct:>5.1f}%)")
     print("-------------------------------------------------------------\n")
 
-    # Fit Model
+    # Fit Calibrated Model
     print("Fitting Calibrated Linear SVM model on train split...")
     base_svm = build_linear_svm(best_params)
     min_class_samples = int(np.min(np.bincount(y_train))) if len(np.unique(y_train)) > 1 else 1
     cal_cv = min(5, max(2, min_class_samples))
-    
+
     calibrated_svm = CalibratedClassifierCV(estimator=base_svm, method="sigmoid", cv=cal_cv)
     calibrated_svm.fit(X_train, y_train)
 
@@ -443,19 +517,36 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
         model=calibrated_svm, dev_data=dev_data, max_fpr=0.01
     )
 
-    # Dev & Test Evaluations using optimal_threshold
+    # Dev Evaluation using optimal_threshold
     dev_metrics, _ = evaluate_and_plot_results(
-        split_data=dev_data, df_raw=dev_df, split_name="dev", scope=scope, model=calibrated_svm, optimal_threshold=optimal_threshold, save_dir=scope_dir
+        split_data=dev_data,
+        df_raw=dev_df,
+        split_name="dev",
+        scope=scope,
+        model=calibrated_svm,
+        optimal_threshold=optimal_threshold,
+        save_dir=scope_dir,
+        left_out_model=left_out_model,
     )
 
+    # Test Evaluation using optimal_threshold (evaluated across all generators in test)
     test_metrics, per_gen_metrics = evaluate_and_plot_results(
-        split_data=test_data, df_raw=test_df, split_name="test", scope=scope, model=calibrated_svm, optimal_threshold=optimal_threshold, save_dir=scope_dir
+        split_data=test_data,
+        df_raw=test_df,
+        split_name="test",
+        scope=scope,
+        model=calibrated_svm,
+        optimal_threshold=optimal_threshold,
+        save_dir=scope_dir,
+        left_out_model=left_out_model,
     )
 
     # Save Summaries
     summary_path = scope_dir / "paper_evaluation_summary.json"
     summary_json = {
         "scope": scope,
+        "loo_active": bool(args.loo),
+        "left_out_model": left_out_model,
         "is_balanced": bool(args.balanced),
         "training_sample_size": int(total_samples),
         "optimal_decision_threshold": float(optimal_threshold),
@@ -475,6 +566,8 @@ def run_full_training_for_scope(scope: str, args, manager: DetectionDataManager)
         "classifier": "linear_svm",
         "kernel": "linear",
         "scope": scope,
+        "loo_active": bool(args.loo),
+        "left_out_model": left_out_model,
         "is_balanced": bool(args.balanced),
         "optimal_decision_threshold": float(optimal_threshold),
         "best_hyperparameters": best_params,
@@ -500,6 +593,12 @@ def main():
         choices=["full", "sentence"],
         help="List of scopes to train (default: full sentence)."
     )
+    parser.add_argument(
+        "--loo",
+        type=str,
+        default=None,
+        help="Leave-One-Out mode. Pass 'random' to leave out a random generator model, or pass a specific model name (e.g. 'gpt-4')."
+    )
     parser.add_argument("--balanced", "--balance_dataset", action="store_true", help="Balance training dataset (50%% Human, 50%% LLM).")
     parser.add_argument("--sample_size", type=int, default=-1, help="Fallback sample size for training (-1 for full data).")
     parser.add_argument("--sample_size_full", type=int, default=None, help="Sample size for 'full' scope training.")
@@ -514,9 +613,10 @@ def main():
     for scope in args.scopes:
         run_full_training_for_scope(scope=scope, args=args, manager=manager)
 
+    output_base_display = args.outputs_dir if args.outputs_dir else (DEFAULT_OUTPUTS_DIR / ("svm_loo" if args.loo else "svm"))
     print("\n" + "=" * 70)
     print("[ALL DONE] Full Linear SVM training & evaluation complete for all requested scopes!")
-    print(f"Results saved under: {args.outputs_dir if args.outputs_dir else DEFAULT_OUTPUTS_DIR / 'svm'}")
+    print(f"Results saved under: {output_base_display}")
     print("=" * 70)
 
 

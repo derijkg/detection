@@ -168,12 +168,10 @@ class OptimizedFastDetectGPTDetector(FastDetectGPTDetector):
             self._score_model, ok_s = _load_causallm(self.scoring_model_name, budget_shared)
             self._samp_model, ok_a = self._score_model, ok_s
         else:
-            # Pin Scoring Model to GPU 0 (Leaves ~1.9 GB free VRAM on GPU 0)
             budget_scoring = {0: "10.0GiB", 1: "0GiB", "cpu": "64GiB"}
             print(f"[LOADER] Loading scoring model '{self.scoring_model_name}' on GPU 0...")
             self._score_model, ok_s = _load_causallm(self.scoring_model_name, budget_scoring)
 
-            # Pin Reference Model to GPU 1 (Leaves ~1.9 GB free VRAM on GPU 1)
             budget_ref = {0: "0GiB", 1: "10.0GiB", "cpu": "64GiB"}
             print(f"[LOADER] Loading reference model '{self.sampling_model_name}' on GPU 1...")
             self._samp_model, ok_a = _load_causallm(self.sampling_model_name, budget_ref)
@@ -215,17 +213,87 @@ def prob_from_two_normals_vec(x: np.ndarray, mu0: float, s0: float, mu1: float, 
     return np.clip(probs, 1e-6, 1.0 - 1e-6)
 
 
-def subsample_stratified(df: pd.DataFrame, max_samples: int | None, seed: int = 42) -> pd.DataFrame:
+# ==========================================
+# Hierarchical Configuration-Balanced Sampler
+# ==========================================
+def subsample_balanced_configurations(
+    df: pd.DataFrame,
+    max_samples: int | None,
+    seed: int = 42,
+    config_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Subsamples `max_samples` from `df` such that:
+    1. Label balance (50% Human / 50% LLM) is maintained.
+    2. Within each class, samples are drawn as equally as possible across all
+       configurations (generator models, domains, datasets, etc.).
+    """
     if max_samples is None or len(df) <= max_samples or max_samples <= 0:
         return df
 
-    half = max_samples // 2
-    sampled_dfs = []
-    for _, group in df.groupby("label"):
-        n_select = min(len(group), half)
-        sampled_dfs.append(group.sample(n=n_select, random_state=seed))
+    if "label" not in df.columns:
+        return df.sample(n=min(len(df), max_samples), random_state=seed)
 
-    return pd.concat(sampled_dfs, ignore_index=True)
+    # Auto-detect configuration/metadata columns if not explicitly passed
+    if config_cols is None:
+        potential_cols = ["model_name", "generator_model", "generator", "model", "domain", "dataset", "source"]
+        config_cols = [col for col in potential_cols if col in df.columns]
+
+    target_per_class = max_samples // 2
+    sampled_dfs = []
+
+    for label_val in [0, 1]:
+        class_df = df[df["label"] == label_val].copy()
+
+        if len(class_df) <= target_per_class:
+            sampled_dfs.append(class_df)
+            continue
+
+        active_cols = [col for col in config_cols if col in class_df.columns and class_df[col].nunique() > 1]
+
+        if not active_cols:
+            sampled_dfs.append(class_df.sample(n=target_per_class, random_state=seed))
+            continue
+
+        for col in active_cols:
+            class_df[col] = class_df[col].fillna("UNKNOWN")
+
+        groups = [group for _, group in class_df.groupby(active_cols)]
+        n_groups = len(groups)
+        target_per_config = max(1, target_per_class // n_groups)
+
+        class_sampled = []
+        budget = target_per_class
+
+        # Pass 1: Draw up to target_per_config per group
+        for group in groups:
+            n_take = min(len(group), target_per_config)
+            sampled_grp = group.sample(n=n_take, random_state=seed)
+            class_sampled.append(sampled_grp)
+            budget -= len(sampled_grp)
+
+        # Pass 2: Distribute remaining budget evenly if any small group had < target_per_config
+        if budget > 0:
+            already_sampled_ids = set().union(*[set(s.index) for s in class_sampled])
+            remaining_df = class_df.loc[~class_df.index.isin(already_sampled_ids)]
+            if len(remaining_df) > 0:
+                extra_sample = remaining_df.sample(n=min(len(remaining_df), budget), random_state=seed)
+                class_sampled.append(extra_sample)
+
+        sampled_dfs.append(pd.concat(class_sampled, ignore_index=True))
+
+    final_df = pd.concat(sampled_dfs, ignore_index=True)
+
+    print(f"\n[CONFIG-SAMPLER] Subsampled total: {len(df)} -> {len(final_df)} samples")
+    for col in config_cols:
+        if col in final_df.columns:
+            counts = final_df.groupby(["label", col]).size().to_dict()
+            print(f"  Configuration breakdown for '{col}':")
+            for (lbl, cfg), count in counts.items():
+                lbl_str = "Human" if lbl == 0 else "LLM"
+                print(f"    - [{lbl_str}] {cfg}: {count} samples")
+
+    return final_df
 
 
 def analyze_and_save_errors(df_eval: pd.DataFrame, scope_dir: Path, scope: str):
@@ -239,6 +307,7 @@ def analyze_and_save_errors(df_eval: pd.DataFrame, scope_dir: Path, scope: str):
     df_eval["error_type"] = np.select(conditions, choices, default="UNKNOWN")
     df_eval["is_error"] = df_eval["error_type"].isin(["FP", "FN"])
 
+    # Save all test predictions (all dataset columns + prediction metadata)
     df_eval.to_csv(scope_dir / "test_predictions.csv", index=False)
     df_eval[df_eval["is_error"]].to_csv(scope_dir / "test_errors.csv", index=False)
     df_eval[df_eval["error_type"] == "FP"].to_csv(scope_dir / "test_false_positives.csv", index=False)
@@ -270,121 +339,144 @@ def evaluate_fastdetectgpt_scope(scope: str, detector: FastDetectGPTDetector, ar
     scope_dir = outputs_base / f"fastdetectgpt_{args.language}" / scope
     scope_dir.mkdir(parents=True, exist_ok=True)
 
-    train_cache = scope_dir / "raw_scores_train_cache.joblib"
-    val_cache = scope_dir / "raw_scores_val_cache.joblib"
-    test_cache = scope_dir / "raw_scores_test_cache.joblib"
+    calib_params_file = scope_dir / "calibration_params.json"
 
     if scope == "sentence":
         max_train = args.max_train_sentence
         max_val = args.max_val_sentence
-    else:  # full
+        max_test = args.max_test_sentence
+    else:  # full / abstract
         max_train = args.max_train_full
         max_val = args.max_val_full
+        max_test = args.max_test_full
 
     # ==========================================
-    # STAGE 1: CALIBRATE (mu, sigma) ON TRAIN
+    # CHECK FOR EXISTING CALIBRATION PARAMS
     # ==========================================
-    raw_train_df = manager.filter_dataframe(DataFilter(splits=["train"], scopes=[scope]))
-    sub_train_df = subsample_stratified(raw_train_df, max_samples=max_train, seed=args.seed)
+    if calib_params_file.exists() and not args.recompute:
+        print(f"\n[{scope.upper()}] Loading cached calibration parameters from '{calib_params_file}'...")
+        with open(calib_params_file, "r") as f:
+            calib_params = json.load(f)
 
-    if train_cache.exists() and not args.recompute:
-        print(f"[{scope.upper()}] Loading cached TRAIN scores...")
-        train_raw_scores = joblib.load(train_cache)
+        mu0 = calib_params["mu0"]
+        sigma0 = calib_params["sigma0"]
+        mu1 = calib_params["mu1"]
+        sigma1 = calib_params["sigma1"]
+        optimal_threshold = calib_params["optimal_threshold_tau"]
+        print(f"  [SKIPPED CALIBRATION] Parameters loaded: mu0={mu0}, sigma0={sigma0}, mu1={mu1}, sigma1={sigma1}, threshold={optimal_threshold}")
     else:
-        print(f"[{scope.upper()}] Scoring TRAIN split ({len(sub_train_df)} stratified samples out of {len(raw_train_df)} total)...")
-        with torch.inference_mode():
-            train_raw_scores = detector.score_batch(sub_train_df["text"].tolist())
-            # TWEAK 2: Add immediate score inspection for TRAIN split
-            print("  [TRAIN SCORES] min/max/mean:", round(float(np.min(train_raw_scores)), 4), round(float(np.max(train_raw_scores)), 4), round(float(np.mean(train_raw_scores)), 4))
-        joblib.dump(train_raw_scores, train_cache)
-        clear_gpu_memory()
+        print(f"\n[{scope.upper()}] No cached parameters found or --recompute passed. Running calibration...")
+        train_cache = scope_dir / "raw_scores_train_cache.joblib"
+        val_cache = scope_dir / "raw_scores_val_cache.joblib"
 
-    train_df, train_raw_scores, train_accounting = filter_and_record_failures(
-        sub_train_df, train_raw_scores, "train", scope_dir
-    )
+        # ------------------------------------------
+        # STAGE 1: CALIBRATE (mu, sigma) ON TRAIN
+        # ------------------------------------------
+        raw_train_df = manager.filter_dataframe(DataFilter(splits=["train"], scopes=[scope]))
+        sub_train_df = subsample_balanced_configurations(raw_train_df, max_samples=max_train, seed=args.seed)
 
-    human_train = train_raw_scores[train_df["label"].values == 0]
-    llm_train = train_raw_scores[train_df["label"].values == 1]
+        if train_cache.exists() and not args.recompute:
+            print(f"[{scope.upper()}] Loading cached TRAIN scores...")
+            train_raw_scores = joblib.load(train_cache)
+        else:
+            print(f"[{scope.upper()}] Scoring TRAIN split ({len(sub_train_df)} configuration-balanced samples out of {len(raw_train_df)} total)...")
+            with torch.inference_mode():
+                train_raw_scores = detector.score_batch(sub_train_df["text"].tolist())
+                print("  [TRAIN SCORES] min/max/mean:", round(float(np.min(train_raw_scores)), 4), round(float(np.max(train_raw_scores)), 4), round(float(np.mean(train_raw_scores)), 4))
+            joblib.dump(train_raw_scores, train_cache)
+            clear_gpu_memory()
 
-    mu0, sigma0 = float(np.mean(human_train)), float(np.std(human_train))
-    mu1, sigma1 = float(np.mean(llm_train)), float(np.std(llm_train))
+        train_df, train_raw_scores, train_accounting = filter_and_record_failures(
+            sub_train_df, train_raw_scores, "train", scope_dir
+        )
 
-    # ==========================================
-    # STAGE 2: FIND OPTIMAL THRESHOLD (tau*) ON VAL
-    # ==========================================
-    raw_val_df = manager.filter_dataframe(DataFilter(splits=["val"], scopes=[scope]))
-    sub_val_df = subsample_stratified(raw_val_df, max_samples=max_val, seed=args.seed)
+        human_train = train_raw_scores[train_df["label"].values == 0]
+        llm_train = train_raw_scores[train_df["label"].values == 1]
 
-    if val_cache.exists() and not args.recompute:
-        print(f"[{scope.upper()}] Loading cached VAL scores...")
-        val_raw_scores = joblib.load(val_cache)
-    else:
-        print(f"[{scope.upper()}] Scoring VAL split ({len(sub_val_df)} stratified samples out of {len(raw_val_df)} total)...")
-        with torch.inference_mode():
-            val_raw_scores = detector.score_batch(sub_val_df["text"].tolist())
-            # TWEAK 2: Add immediate score inspection for VAL split
-            print("  [VAL SCORES] min/max/mean:", round(float(np.min(val_raw_scores)), 4), round(float(np.max(val_raw_scores)), 4), round(float(np.mean(val_raw_scores)), 4))
-        joblib.dump(val_raw_scores, val_cache)
-        clear_gpu_memory()
+        mu0, sigma0 = float(np.mean(human_train)), float(np.std(human_train))
+        mu1, sigma1 = float(np.mean(llm_train)), float(np.std(llm_train))
 
-    val_df, val_raw_scores, val_accounting = filter_and_record_failures(
-        sub_val_df, val_raw_scores, "val", scope_dir
-    )
+        # ------------------------------------------
+        # STAGE 2: FIND OPTIMAL THRESHOLD (tau*) ON VAL
+        # ------------------------------------------
+        raw_val_df = manager.filter_dataframe(DataFilter(splits=["val"], scopes=[scope]))
+        sub_val_df = subsample_balanced_configurations(raw_val_df, max_samples=max_val, seed=args.seed)
 
-    val_probs = prob_from_two_normals_vec(val_raw_scores, mu0, sigma0, mu1, sigma1)
+        if val_cache.exists() and not args.recompute:
+            print(f"[{scope.upper()}] Loading cached VAL scores...")
+            val_raw_scores = joblib.load(val_cache)
+        else:
+            print(f"[{scope.upper()}] Scoring VAL split ({len(sub_val_df)} configuration-balanced samples out of {len(raw_val_df)} total)...")
+            with torch.inference_mode():
+                val_raw_scores = detector.score_batch(sub_val_df["text"].tolist())
+                print("  [VAL SCORES] min/max/mean:", round(float(np.min(val_raw_scores)), 4), round(float(np.max(val_raw_scores)), 4), round(float(np.mean(val_raw_scores)), 4))
+            joblib.dump(val_raw_scores, val_cache)
+            clear_gpu_memory()
 
-    fpr_v, tpr_v, thresholds_v = roc_curve(val_df["label"].values, val_probs)
-    optimal_idx = int(np.argmax(tpr_v - fpr_v))
+        val_df, val_raw_scores, val_accounting = filter_and_record_failures(
+            sub_val_df, val_raw_scores, "val", scope_dir
+        )
 
-    valid_thresholds = np.copy(thresholds_v)
-    if len(valid_thresholds) > 1 and valid_thresholds[0] > 1.0:
-        valid_thresholds[0] = float(np.max(val_probs))
+        val_probs = prob_from_two_normals_vec(val_raw_scores, mu0, sigma0, mu1, sigma1)
 
-    optimal_threshold = float(np.clip(valid_thresholds[optimal_idx], 0.0, 1.0))
+        fpr_v, tpr_v, thresholds_v = roc_curve(val_df["label"].values, val_probs)
+        optimal_idx = int(np.argmax(tpr_v - fpr_v))
+
+        valid_thresholds = np.copy(thresholds_v)
+        if len(valid_thresholds) > 1 and valid_thresholds[0] > 1.0:
+            valid_thresholds[0] = float(np.max(val_probs))
+
+        optimal_threshold = float(np.clip(valid_thresholds[optimal_idx], 0.0, 1.0))
+
+        calib_params = {
+            "scope": scope,
+            "language": args.language,
+            "mu0": round(mu0, 6),
+            "sigma0": round(sigma0, 6),
+            "mu1": round(mu1, 6),
+            "sigma1": round(sigma1, 6),
+            "optimal_threshold_tau": round(optimal_threshold, 6),
+            "sample_accounting": {
+                **train_accounting,
+                **val_accounting,
+            },
+        }
+        with open(calib_params_file, "w") as f:
+            json.dump(calib_params, f, indent=4)
 
     print("\n" + "=" * 70)
-    print(f" FAST-DETECTGPT CALIBRATION [{scope.upper()} | LANG: {args.language.upper()}] ")
-    print(f"  Train Valid Samples       : {len(train_df)} (Human: {sum(train_df['label']==0)}, LLM: {sum(train_df['label']==1)})")
-    print(f"  Train Parameters          : mu0={mu0:.4f}, sigma0={sigma0:.4f} | mu1={mu1:.4f}, sigma1={sigma1:.4f}")
-    print(f"  Val Valid Samples         : {len(val_df)}")
-    print(f"  Val Optimal Threshold (\u03c4*): {optimal_threshold:.6f}")
+    print(f" FAST-DETECTGPT PARAMETERS [{scope.upper()} | LANG: {args.language.upper()}] ")
+    print(f"  Parameters : mu0={mu0:.4f}, sigma0={sigma0:.4f} | mu1={mu1:.4f}, sigma1={sigma1:.4f}")
+    print(f"  Threshold  : optimal_threshold_tau={optimal_threshold:.6f}")
     print("=" * 70)
 
-    calib_params = {
-        "scope": scope,
-        "language": args.language,
-        "mu0": round(mu0, 6),
-        "sigma0": round(sigma0, 6),
-        "mu1": round(mu1, 6),
-        "sigma1": round(sigma1, 6),
-        "optimal_threshold_tau": round(optimal_threshold, 6),
-        "sample_accounting": {
-            **train_accounting,
-            **val_accounting,
-        },
-    }
-    with open(scope_dir / "calibration_params.json", "w") as f:
-        json.dump(calib_params, f, indent=4)
-
     # ==========================================
-    # STAGE 3: EVALUATE ON HELD-OUT TEST SPLIT
+    # STAGE 3: EVALUATE ON SUBSAMPLED TEST SPLIT
     # ==========================================
+    test_cache = scope_dir / "raw_scores_test_cache.joblib"
     raw_test_df = manager.filter_dataframe(DataFilter(splits=["test"], scopes=[scope]))
+    sub_test_df = subsample_balanced_configurations(raw_test_df, max_samples=max_test, seed=args.seed)
 
+    # Validate cached test raw scores match current subsample length
+    cached_scores_valid = False
     if test_cache.exists() and not args.recompute:
-        print(f"[{scope.upper()}] Loading cached TEST scores...")
         test_raw_scores = joblib.load(test_cache)
-    else:
-        print(f"[{scope.upper()}] Scoring TEST split ({len(raw_test_df)} full samples)...")
+        if len(test_raw_scores) == len(sub_test_df):
+            print(f"[{scope.upper()}] Loading cached TEST scores ({len(test_raw_scores)} samples)...")
+            cached_scores_valid = True
+        else:
+            print(f"[{scope.upper()}] Test cache size mismatch ({len(test_raw_scores)} vs {len(sub_test_df)}). Recomputing...")
+
+    if not cached_scores_valid:
+        print(f"[{scope.upper()}] Scoring TEST split ({len(sub_test_df)} configuration-balanced samples out of {len(raw_test_df)} total)...")
         with torch.inference_mode():
-            test_raw_scores = detector.score_batch(raw_test_df["text"].tolist())
-            print("  [TEST SCORES] Sample raw scores:", test_raw_scores[:10])
+            test_raw_scores = detector.score_batch(sub_test_df["text"].tolist())
             print("  [TEST SCORES] min/max/mean:", round(float(np.min(test_raw_scores)), 4), round(float(np.max(test_raw_scores)), 4), round(float(np.mean(test_raw_scores)), 4))
         joblib.dump(test_raw_scores, test_cache)
         clear_gpu_memory()
 
     test_df, test_raw_scores, test_accounting = filter_and_record_failures(
-        raw_test_df, test_raw_scores, "test", scope_dir
+        sub_test_df, test_raw_scores, "test", scope_dir
     )
     test_labels = test_df["label"].values
 
@@ -494,24 +586,14 @@ def evaluate_fastdetectgpt_scope(scope: str, detector: FastDetectGPTDetector, ar
     plt.savefig(plot_path, dpi=300)
     plt.close()
 
-    latex_table_path = scope_dir / "test_metrics_table.tex"
-    with open(latex_table_path, "w") as f:
-        f.write("\\begin{table}[htbp]\n\\centering\n")
-        f.write(f"\\caption{{Fast-DetectGPT Test Evaluation ({scope.upper()}). Calibrated on Train ($\\mu_0={mu0:.2f}, \\mu_1={mu1:.2f}$), Threshold on Val ($\\tau^*={optimal_threshold:.4f}$). Total test samples: {test_accounting['test_total_samples']} ({test_accounting['test_failed_samples']} failed, {test_accounting['test_failure_rate_pct']:.2f}\\% rate).}}\n")
-        f.write("\\begin{tabular}{lccccc}\n\\hline\n")
-        f.write("Group & pAUC@0.01 & ROC-AUC & Acc & F1 & TPR@1\\%FPR \\\\\n\\hline\n")
-        f.write(f"Overall Test Set & {pauc_001_val:.4f} & {roc_auc_val:.4f} & {acc:.4f} & {f1:.4f} & {tpr_at_1fpr:.4f} \\\\\n\\hline\n")
-        f.write("\\end{tabular}\n\\end{table}\n")
-
     summary_path = scope_dir / "test_paper_evaluation_summary.json"
     with open(summary_path, "w") as f:
         json.dump({
-            "calibration": calib_params,
             "test_sample_accounting": test_accounting,
             "overall_test_metrics": overall_metrics,
         }, f, indent=4)
 
-    print(f"[COMPLETED] Results saved to: {scope_dir}\n")
+    print(f"[COMPLETED] Predictions saved to: {scope_dir / 'test_predictions.csv'}\n")
 
 
 def main():
@@ -521,17 +603,22 @@ def main():
     parser.add_argument("--scopes", nargs="+", default=["sentence", "full"], choices=["sentence", "full"])
     parser.add_argument("--language", type=str, default="nl", choices=["en", "nl"])
 
+    # Calibration split max samples
     parser.add_argument("--max_train_sentence", type=int, default=10000, help="Max Train samples for sentence calibration")
-    parser.add_argument("--max_train_full", type=int, default=5000, help="Max Train samples for full calibration")
+    parser.add_argument("--max_train_full", type=int, default=2000, help="Max Train samples for full calibration")
     parser.add_argument("--max_val_sentence", type=int, default=5000, help="Max Val samples for sentence thresholding")
     parser.add_argument("--max_val_full", type=int, default=1000, help="Max Val samples for full thresholding")
+
+    # Test split max samples
+    parser.add_argument("--max_test_sentence", type=int, default=10000, help="Max Test samples for sentence evaluation")
+    parser.add_argument("--max_test_full", type=int, default=5000, help="Max Test samples for full evaluation")
 
     parser.add_argument("--outputs_dir", type=str, default=None)
     parser.add_argument("--scoring_model", type=str, default=None)
     parser.add_argument("--reference_model", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--recompute", action="store_true")
+    parser.add_argument("--recompute", action="store_true", help="Force recomputing calibration & scores even if files exist")
 
     args = parser.parse_args()
 

@@ -1,5 +1,4 @@
 outputs/
-data_static/
 old/
 __pycache__/
 *.pyc

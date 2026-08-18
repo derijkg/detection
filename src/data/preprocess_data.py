@@ -20,7 +20,12 @@ INPUT_PATH = PROJECT_ROOT / "data_static" / "raw" / "llm_added.parquet"
 OUTPUT_DIR = PROJECT_ROOT / "data_static" / "preprocessed"
 
 NON_PRINTABLE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
-INVALID_SENTENCE_VALUES: Set[str] = {"generation_failed", "validation_failed", "nan", "none", "null", ""}
+
+FAILED_GENERATION_VALUES: Set[str] = {"generation_failed", "failed_generation"}
+FAILED_VALIDATION_VALUES: Set[str] = {"validation_failed", "failed_validation"}
+INVALID_SENTENCE_VALUES: Set[str] = {
+    "nan", "none", "null", ""
+} | FAILED_GENERATION_VALUES | FAILED_VALIDATION_VALUES
 
 
 def is_none_or_nan(val: Any) -> bool:
@@ -45,16 +50,38 @@ def normalize_text(text: Any) -> str:
     return text_str.strip()
 
 
-def is_valid_sentence(text: Any) -> bool:
+def is_valid_sentence(text: Any, counts: Optional[Dict[str, int]] = None) -> bool:
     if is_none_or_nan(text) or isinstance(text, (list, tuple, np.ndarray)):
+        if counts is not None:
+            counts["null_or_empty"] += 1
         return False
+
     clean_str = normalize_text(text)
-    if not clean_str or clean_str.lower() in INVALID_SENTENCE_VALUES:
+    if not clean_str:
+        if counts is not None:
+            counts["null_or_empty"] += 1
         return False
+
+    clean_lower = clean_str.lower()
+    if clean_lower in FAILED_GENERATION_VALUES:
+        if counts is not None:
+            counts["failed_generation"] += 1
+        return False
+
+    if clean_lower in FAILED_VALIDATION_VALUES:
+        if counts is not None:
+            counts["failed_validation"] += 1
+        return False
+
+    if clean_lower in INVALID_SENTENCE_VALUES:
+        if counts is not None:
+            counts["other_invalid"] += 1
+        return False
+
     return True
 
 
-def parse_and_clean_sentence_array(raw_val: Any) -> List[str]:
+def parse_and_clean_sentence_array(raw_val: Any, counts: Optional[Dict[str, int]] = None) -> List[str]:
     if is_none_or_nan(raw_val):
         return []
     parsed_list: List[Any] = []
@@ -77,7 +104,7 @@ def parse_and_clean_sentence_array(raw_val: Any) -> List[str]:
 
     cleaned = []
     for item in parsed_list:
-        if is_valid_sentence(item):
+        if is_valid_sentence(item, counts=counts):
             cleaned.append(normalize_text(item))
     return cleaned
 
@@ -141,14 +168,15 @@ def generate_synthetic_rows_for_row(row: pd.Series, split_map: Dict[Any, str],
         'split': row_split
     }
 
-    human_sents = parse_and_clean_sentence_array(row.get('abstract_sentence', []))
+    # Pass counts=None here so re-parsing doesn't double count filter statistics
+    human_sents = parse_and_clean_sentence_array(row.get('abstract_sentence', []), counts=None)
     if len(human_sents) < 3:
         return []
 
     valid_models: Dict[str, List[str]] = {}
     for col in row.index:
         if col.endswith('_single'):
-            clean_sents = parse_and_clean_sentence_array(row[col])
+            clean_sents = parse_and_clean_sentence_array(row[col], counts=None)
             if clean_sents:
                 model_name = col.rsplit('_single', 1)[0]
                 valid_models[model_name] = clean_sents
@@ -186,6 +214,14 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
     split_map = create_id_splits(raw_df, id_col='_id')
     raw_df['split'] = raw_df['_id'].map(split_map)
     
+    # Counter for filtered records
+    filter_counts = {
+        'failed_generation': 0,
+        'failed_validation': 0,
+        'null_or_empty': 0,
+        'other_invalid': 0
+    }
+
     rows: List[Dict[str, Any]] = []
     meta_cols = ['_id', 'source', 'keywords', 'year', 'split']
     
@@ -198,7 +234,7 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
         meta = {col: row[col] for col in meta_cols if col in row}
         
         # --- A. Pure Human Text ---
-        if 'abstract' in row and is_valid_sentence(row['abstract']):
+        if 'abstract' in row and is_valid_sentence(row['abstract'], counts=filter_counts):
             rows.append({
                 **meta, 'text': normalize_text(row['abstract']),
                 'label': 0, 'llm_ratio': 0.0, 'model_name': 'human',
@@ -206,7 +242,7 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
             })
 
         if 'abstract_sentence' in row:
-            human_sents = parse_and_clean_sentence_array(row['abstract_sentence'])
+            human_sents = parse_and_clean_sentence_array(row['abstract_sentence'], counts=filter_counts)
             for h_sent in human_sents:
                 rows.append({
                     **meta, 'text': h_sent,
@@ -226,7 +262,7 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
             model_name, suffix = col.rsplit('_', 1)
             
             if suffix == 'single':
-                clean_sents = parse_and_clean_sentence_array(raw_val)
+                clean_sents = parse_and_clean_sentence_array(raw_val, counts=filter_counts)
                 for s_text in clean_sents:
                     rows.append({
                         **meta, 'text': s_text,
@@ -234,7 +270,7 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
                         'scope': 'single', 'generation_type': 'single_rewrite'
                     })
             elif suffix == 'full':
-                if is_valid_sentence(raw_val):
+                if is_valid_sentence(raw_val, counts=filter_counts):
                     rows.append({
                         **meta, 'text': normalize_text(raw_val),
                         'label': 1, 'llm_ratio': 1.0, 'model_name': model_name,
@@ -242,7 +278,7 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
                     })
             elif suffix in ['25', '50', '75']:
                 if row_split == 'test':
-                    if is_valid_sentence(raw_val):
+                    if is_valid_sentence(raw_val, counts=filter_counts):
                         rows.append({
                             **meta, 'text': normalize_text(raw_val),
                             'label': 1, 'llm_ratio': float(suffix) / 100.0,
@@ -254,6 +290,18 @@ def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
         if row_split == 'test':
             synth_rows = generate_synthetic_rows_for_row(row, split_map)
             rows.extend(synth_rows)
+
+    # Print summary of filtered data
+    print("\n\n" + "=" * 45)
+    print("          FILTERED DATA SUMMARY          ")
+    print("=" * 45)
+    print(f"  Failed Generation Filtered : {filter_counts['failed_generation']:,}")
+    print(f"  Failed Validation Filtered : {filter_counts['failed_validation']:,}")
+    print(f"  Null / Empty Filtered      : {filter_counts['null_or_empty']:,}")
+    print(f"  Other Invalid Keywords     : {filter_counts['other_invalid']:,}")
+    print("=" * 45)
+    print(f"  TOTAL FILTERED ITEMS       : {sum(filter_counts.values()):,}")
+    print("=" * 45 + "\n")
 
     long_df = pd.DataFrame(rows)
     return long_df

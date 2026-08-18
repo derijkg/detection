@@ -31,7 +31,7 @@ def compute_subset_metrics(df_sub, human_df):
     
     y_true = combined_df['label'].values
     y_prob = combined_df['prob_llm'].values
-    y_pred = combined_df['pred_llm'].values
+    y_pred = combined_df['pred'].values
     
     has_both = len(np.unique(y_true)) > 1
     mean_prob = df_sub['prob_llm'].mean()
@@ -128,7 +128,7 @@ def generate_synthetic_multi_table(csv_path: str) -> str:
     return "\n".join(latex_lines)
 
 if __name__ == "__main__":
-    csv_file = "/home/gderijck/detection/outputs/svm/full/test_predictions.csv"  # Path to your test predictions CSV
+    csv_file = "/home/gderijck/detection/outputs/deberta_no_tune/deberta_full/mdeberta_predictions_full.csv"  # Path to your test predictions CSV
     latex_code = generate_synthetic_multi_table(csv_file)
     
     print("\n--- GENERATED LATEX TABLE FOR SYNTHETIC MULTI ---\n")
