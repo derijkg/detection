@@ -9,3 +9,58 @@ __pycache__/
 .mypy_cache/
 extra/
 evals/
+
+
+
+Because you have heavy files (like .safetensors, .arrow, .parquet, and .joblib), running git add -A right now without an updated .gitignore would blow up your Git history size to tens of gigabytes and freeze Git.
+
+Here is the bulletproof, 4-step way to safely preserve everything and start a clean refactored branch.
+Step 1: Make a Physical Backup on the Server (100% Fail-Safe)
+
+First, make a direct disk-level copy of your entire folder on calc12. This guarantees you cannot lose a single file or intermediate result no matter what happens in Git:
+code Bash
+
+# Run this from your home directory (~/)
+cd ~
+cp -r detection detection_backup_full
+cd detection
+
+Step 2: Put the .gitignore in Place First
+
+Create/overwrite your .gitignore right now before making any branch commits. This tells Git to save all your old code and scripts, but ignore the heavy binaries:
+code Bash
+
+cat << 'EOF' > .gitignore
+# Heavy data, features and caches
+data_static/
+data/
+*.parquet
+*.csv
+*.arrow
+*.joblib
+*.db
+*.sqlite3
+
+# Model weights & Checkpoints
+outputs*/
+output/
+optuna_trials/
+checkpoints/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+wandb/
+
+# Local workspace
+legacy/
+scratch/
+EOF

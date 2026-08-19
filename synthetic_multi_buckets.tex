@@ -1,0 +1,22 @@
+\begin{table}[htbp]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\caption{Detection performance for the \texttt{synthetic\_multi} generator across substitution buckets ('full' scope).}
+\label{tab:synthetic_multi_bucket_breakdown}
+\begin{tabular}{lrrrrrrr}
+\toprule
+\textbf{Substitution Bucket} & \textbf{Samples ($N$)} & \textbf{Mean $P(\text{LLM})$} & \textbf{ROC-AUC} & \textbf{Accuracy} & \textbf{F1-Score} & \textbf{Precision} & \textbf{Recall} \\
+\midrule
+\multicolumn{8}{l}{\textbf{Human Baseline}} \\
+Human Text (0\% LLM) & 1,709 & 0.0450 & -- & 0.9895 & -- & -- & 0.0105$^\dagger$ \\
+\midrule
+\multicolumn{8}{l}{\textbf{\texttt{synthetic\_multi} Substitution Ratios}} \\
+25\% Substitution & 1,709 & 0.0901 & 0.6022 & 0.5082 & 0.0519 & 0.7188 & 0.0269 \\
+50\% Substitution & 1,709 & 0.1509 & 0.7031 & 0.5252 & 0.1136 & 0.8525 & 0.0609 \\
+75\% Substitution & 1,709 & 0.2829 & 0.8041 & 0.5664 & 0.2485 & 0.9316 & 0.1434 \\
+\bottomrule
+\end{tabular}
+\vspace{3pt}
+\hfill \footnotesize\textit{$^\dagger$ Note: For Human Text, Recall represents False Positive Rate (FPR), and Accuracy represents Specificity (TNR).}
+\end{table}
