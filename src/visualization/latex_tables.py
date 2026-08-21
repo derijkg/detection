@@ -6,6 +6,14 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 
+def escape_latex(s: Any) -> str:
+    """Escapes special LaTeX characters in dynamic string values."""
+    if s is None:
+        return ""
+    st = str(s)
+    return st.replace("\\", "\\textbackslash ").replace("_", r"\_").replace("%", r"\%").replace("&", r"\&").replace("$", r"\$")
+
+
 def export_deberta_hyperparameters_table(
     best_params: Dict[str, Any],
     search_spaces: Dict[str, str],
@@ -15,11 +23,12 @@ def export_deberta_hyperparameters_table(
     final_sample_size: int,
     n_trials: int = 10,
 ):
+    clean_scope = escape_latex(scope)
     tex = [
         r"\begin{table}[htbp]",
         r"\centering",
         r"\small",
-        r"\caption{Hyperparameter optimization configuration and optimal values for mDeBERTa-v3 (" + scope.capitalize() + r" Abstracts).}",
+        r"\caption{Hyperparameter optimization configuration and optimal values for mDeBERTa-v3 (" + clean_scope.capitalize() + r" Abstracts).}",
         r"\label{tab:deberta_hyperparams_" + scope.lower() + r"}",
         r"\begin{tabular}{lll}",
         r"\toprule",
@@ -39,7 +48,7 @@ def export_deberta_hyperparameters_table(
     for k, (label, s_range) in param_display.items():
         val = best_params.get(k)
         if val is not None:
-            val_str = f"{val:.2e}" if (isinstance(val, float) and val < 0.01) else (f"{val:.4f}" if isinstance(val, float) else str(val))
+            val_str = f"{val:.2e}" if (isinstance(val, float) and val < 0.01) else (f"{val:.4f}" if isinstance(val, float) else escape_latex(val))
             tex.append(f"{label} & {s_range} & \\textbf{{{val_str}}} \\\\")
 
     tex.extend([
@@ -74,7 +83,7 @@ def export_hyperparameters_table(
             return f"{val:.4f}" if (abs(val) < 1e-2 or abs(val) > 1e2) else f"{val:.3f}"
         if isinstance(val, tuple):
             return f"({val[0]}, {val[1]})"
-        return str(val)
+        return escape_latex(val)
 
     w_ngram = (best_params.get('word_min_ngram', 1), best_params.get('word_max_ngram', 2))
     c_ngram = (best_params.get('char_min_ngram', 3), best_params.get('char_max_ngram', 5))
@@ -89,17 +98,17 @@ def export_hyperparameters_table(
         ("", "Min DF", search_spaces.get("char_min_df", ""), str(best_params.get('char_min_df', 2))),
         ("Stylometrics", "Use Stylometrics", search_spaces.get("use_stylometrics", ""), str(best_params.get('use_stylometrics', True))),
         ("", "Subspace Weight", search_spaces.get("sty_weight", ""), f_val(best_params.get('sty_weight', 1.0))),
-        ("SVM Solver", "Kernel", search_spaces.get("kernel", ""), str(best_params.get('kernel', 'linear'))),
+        ("SVM Solver", "Kernel", search_spaces.get("kernel", ""), escape_latex(best_params.get('kernel', 'linear'))),
         ("", "Regularization (C)", search_spaces.get("C", ""), f_val(best_params.get('C', 1.0))),
-        ("", "Loss Function", search_spaces.get("linear_loss", ""), str(best_params.get('linear_loss', 'squared_hinge'))),
-        ("", "Class Weighting", search_spaces.get("class_weight", ""), str(best_params.get('weight_mode', 'balanced'))),
+        ("", "Loss Function", search_spaces.get("linear_loss", ""), escape_latex(best_params.get('linear_loss', 'squared_hinge'))),
+        ("", "Class Weighting", search_spaces.get("class_weight", ""), escape_latex(best_params.get('weight_mode', 'balanced'))),
     ]
 
     latex = [
         r"\begin{table}[h]",
         r"\centering",
         r"\small",
-        f"\\caption{{SVM Hyperparameter Search Space and Optimal Configuration ({scope.capitalize()}-level).}}",
+        f"\\caption{{SVM Hyperparameter Search Space and Optimal Configuration ({escape_latex(scope).capitalize()}-level).}}",
         f"\\label{{tab:svm_hyperparams_{scope}}}",
         r"\begin{tabular}{llcc}",
         r"\toprule",
@@ -108,7 +117,7 @@ def export_hyperparameters_table(
     ]
 
     for comp, param, space, opt in rows:
-        latex.append(f"{comp} & {param} & {space} & {opt} \\\\")
+        latex.append(f"{escape_latex(comp)} & {escape_latex(param)} & {space} & {opt} \\\\")
 
     latex.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
     output_path.write_text("\n".join(latex), encoding="utf-8")
@@ -117,12 +126,13 @@ def export_hyperparameters_table(
 def export_performance_table(summary: Dict[str, Any], scope: str, model_name: str, output_path: Path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_model = escape_latex(model_name)
 
     latex = [
         r"\begin{table}[h]",
         r"\centering",
         r"\small",
-        f"\\caption{{Test Performance Summary for {model_name.upper()} ({scope.capitalize()}-level).}}",
+        f"\\caption{{Test Performance Summary for {clean_model.upper()} ({escape_latex(scope).capitalize()}-level).}}",
         f"\\label{{tab:perf_{model_name}_{scope}}}",
         r"\begin{tabular}{lc}",
         r"\toprule",
@@ -146,12 +156,13 @@ def export_performance_table(summary: Dict[str, Any], scope: str, model_name: st
 def export_robustness_table(ratio_stats: List[Dict[str, Any]], scope: str, model_name: str, output_path: Path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_model = escape_latex(model_name)
 
     latex = [
         r"\begin{table}[h]",
         r"\centering",
         r"\small",
-        f"\\caption{{Detection Sensitivity across Gradual LLM Substitution Ratios ({model_name.upper()}, {scope.capitalize()}).}}",
+        f"\\caption{{Detection Sensitivity across Gradual LLM Substitution Ratios ({clean_model.upper()}, {escape_latex(scope).capitalize()}).}}",
         f"\\label{{tab:robustness_{model_name}_{scope}}}",
         r"\begin{tabular}{cccc}",
         r"\toprule",
@@ -160,7 +171,7 @@ def export_robustness_table(ratio_stats: List[Dict[str, Any]], scope: str, model
     ]
 
     for row in ratio_stats:
-        latex.append(f"{row['target_ratio']} & {row['actual_ratio']:.3f} & {row['flagged_pct']:.2f}\\% & {row['avg_score']:.4f} \\\\")
+        latex.append(f"{escape_latex(row['target_ratio'])} & {row['actual_ratio']:.3f} & {row['flagged_pct']:.2f}\\% & {row['avg_score']:.4f} \\\\")
 
     latex.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
     output_path.write_text("\n".join(latex), encoding="utf-8")
@@ -189,15 +200,16 @@ def export_multi_model_comparison_table(summary_json_paths: List[Path], scope: s
         "deberta": "mDeBERTa-v3 (CVaR-DRO)"
     }
 
+    clean_scope = escape_latex(scope)
     tex = [
         r"\begin{table*}[htbp]",
         r"\centering",
         r"\small",
-        r"\caption{Comprehensive Benchmark Comparison across Detection Paradigms (" + scope.capitalize() + r" Abstracts). Operational threshold $\tau$ calibrated on Dev split at $\text{FPR} \le 1.0\%$.}",
+        r"\caption{Comprehensive Benchmark Comparison across Detection Paradigms (" + clean_scope.capitalize() + r" Abstracts). Operational threshold $\tau$ calibrated on Dev split at $\text{FPR} \le 1.0\%$.}",
         r"\label{tab:model_comparison_" + scope.lower() + r"}",
         r"\begin{tabular}{l" + "c" * len(summaries) + r"}",
         r"\toprule",
-        r"\textbf{Metric} & " + " & ".join([r"\textbf{" + model_display_names.get(s["model_name"].lower(), s["model_name"].upper()) + r"}" for s in summaries]) + r" \\",
+        r"\textbf{Metric} & " + " & ".join([r"\textbf{" + model_display_names.get(s["model_name"].lower(), escape_latex(s["model_name"])) + r"}" for s in summaries]) + r" \\",
         r"\midrule",
     ]
 

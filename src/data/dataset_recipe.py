@@ -29,37 +29,39 @@ class DataTransforms:
         seed: int = 42
     ) -> pd.DataFrame:
         """
-        Extracts sentences from full abstracts (both human and LLM rewrites),
-        applies text normalization, preserves document _id stratification, 
-        and combines them with the standard sentence-scope data.
+        1. Keeps ALL original human sentences (label == 0) and AI sentences from `sentence` scope.
+        2. Sentence-tokenizes ONLY the AI full-abstract rewrites (label == 1) from `full` scope.
+        3. Preserves document `_id` for group-stratified cross-validation and tuning.
         """
-        extracted_records = []
+        extracted_ai_records = []
         id_col = next((c for c in ["_id", "doc_id", "id"] if c in df_full.columns), "_id")
 
-        for _, row in df_full.iterrows():
+        # Filter ONLY AI rewrites from full abstracts (label == 1)
+        ai_full_df = df_full[df_full["label"] == 1]
+
+        for _, row in ai_full_df.iterrows():
             doc_id = row.get(id_col, "doc_unknown")
-            label = int(row.get("label", 0))
-            gen_model = row.get("generator_model", row.get("model_name", "human" if label == 0 else "unknown"))
-            llm_ratio = row.get("llm_ratio", 1.0 if label == 1 else 0.0)
+            gen_model = row.get("generator_model", row.get("model_name", "unknown"))
+            llm_ratio = row.get("llm_ratio", 1.0)
             split_val = row.get("split", "train")
             raw_text = str(row.get("text", "")).strip()
 
             if not raw_text:
                 continue
 
-            # Split into sentences
+            # Split AI full abstract into individual sentences
             sents = [s.strip() for s in RE_SENT_SPLIT.split(raw_text) if len(s.strip()) > 5]
             if not sents:
                 sents = [raw_text]
 
             for idx, s in enumerate(sents):
                 norm_s = normalize_text(s)
-                extracted_records.append({
-                    "_id": doc_id,                       # Crucial for group-stratified CV / tuning
-                    "sentence_id": f"{doc_id}_s{idx}",
+                extracted_ai_records.append({
+                    "_id": doc_id,                        # Parent document ID for grouping
+                    "sentence_id": f"{doc_id}_ai_full_s{idx}",
                     "text": norm_s,
                     "normalized_text": norm_s,
-                    "label": label,
+                    "label": 1,                           # AI class
                     "scope": "sentence_augmented",
                     "generator_model": gen_model,
                     "model_name": gen_model,
@@ -69,19 +71,18 @@ class DataTransforms:
                     "year": row.get("year", 2024),
                 })
 
-        df_extracted = pd.DataFrame(extracted_records)
+        df_ai_extracted = pd.DataFrame(extracted_ai_records)
 
-        # Merge with existing sentence-level preprocessed data
+        # Merge base sentence dataset (containing genuine human + original AI sentences) with newly extracted AI sentences
         if not df_sentence.empty:
-            # Ensure text column is normalized
             if "normalized_text" not in df_sentence.columns and "text" in df_sentence.columns:
                 df_sentence["normalized_text"] = df_sentence["text"].apply(normalize_text)
             
-            combined_df = pd.concat([df_sentence, df_extracted], ignore_index=True)
+            combined_df = pd.concat([df_sentence, df_ai_extracted], ignore_index=True)
         else:
-            combined_df = df_extracted
+            combined_df = df_ai_extracted
 
-        # Deduplicate exact duplicate sentences if any exist within the same document
+        # Deduplicate identical sentences under the same document ID
         dedup_cols = ["_id", "text", "label"] if "_id" in combined_df.columns else ["text", "label"]
         combined_df = combined_df.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
 

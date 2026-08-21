@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-from scipy.interpolate import interp1d
 from scipy.special import softmax
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, roc_curve
 
@@ -41,11 +40,10 @@ def compute_stratified_sample_weights(df: pd.DataFrame) -> torch.Tensor:
     return torch.tensor(raw_weights, dtype=torch.float32)
 
 
-
 class RockafellarUryasevCVaRLoss(nn.Module):
     """
     DDP-safe Rockafellar-Uryasev (2000) Conditional Value-at-Risk (CVaR) loss.
-    Maintains graph continuity for eta across all distributed micro-batch configurations.
+    Maintains continuous graph gradients for eta across micro-batch steps.
     """
     def __init__(self, alpha: float = 0.01, lambda_neg: float = 2.0, initial_eta: float = 0.693, temp: float = 0.1):
         super().__init__()
@@ -64,7 +62,6 @@ class RockafellarUryasevCVaRLoss(nn.Module):
         n_neg = neg_mask.sum()
 
         pos_loss = losses[pos_mask].mean() if n_pos > 0 else (0.0 * logits.sum())
-
         eta_val = self.eta.to(logits.device)
 
         if n_neg > 0:
@@ -233,8 +230,13 @@ def compute_deberta_metrics(eval_pred) -> Dict[str, float]:
         return {"pauc_1fpr": 0.5, "tpr_at_1fpr": 0.0, "roc_auc": 0.5, "accuracy": 0.0, "f1": 0.0}
 
     fpr, tpr, _ = roc_curve(labels, probs)
-    interp_fn = interp1d(fpr, tpr, bounds_error=False, fill_value=(0.0, 1.0))
-    tpr_at_1fpr = float(interp_fn(0.01))
+    unique_fpr, indices = np.unique(fpr, return_index=True)
+    max_tpr = np.zeros_like(unique_fpr)
+    for i, u_fpr in enumerate(unique_fpr):
+        max_tpr[i] = np.max(tpr[fpr == u_fpr])
+    max_tpr = np.maximum.accumulate(max_tpr)
+
+    tpr_at_1fpr = float(np.interp(0.01, unique_fpr, max_tpr, left=0.0, right=1.0))
 
     try:
         pauc_1fpr = float(roc_auc_score(labels, probs, max_fpr=0.01))

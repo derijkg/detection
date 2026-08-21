@@ -2,8 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Tuple, Any
-import joblib
+from typing import Any, Dict, List, Optional, Tuple, Union
 import nltk
 import numpy as np
 import pandas as pd
@@ -36,7 +35,7 @@ def compute_vectorized_gini(probs: np.ndarray, top_k: int = 500) -> Union[float,
     total_mass = np.sum(sorted_topk, axis=-1, keepdims=True)
     lorenz_area = np.sum(sorted_topk * weights, axis=-1, keepdims=True) / (total_mass + 1e-12)
     gini = (1.0 - 2.0 * lorenz_area).squeeze(-1)
-    return gini[0] if is_1d else gini
+    return float(gini[0]) if is_1d else gini
 
 
 def compute_zipf_exponent(v_logits: np.ndarray, top_k: int = 20) -> Union[float, np.ndarray]:
@@ -57,7 +56,7 @@ def compute_zipf_exponent(v_logits: np.ndarray, top_k: int = 20) -> Union[float,
     mean_y = np.mean(sorted_topk, axis=-1, keepdims=True)
     cov_xy = np.mean((log_ranks - mean_x) * (sorted_topk - mean_y), axis=-1)
     zipf_alpha = -cov_xy / (var_x + 1e-12)
-    return zipf_alpha[0] if is_1d else zipf_alpha
+    return float(zipf_alpha[0]) if is_1d else zipf_alpha
 
 
 def compute_zipf_mandelbrot_params(v_logits: np.ndarray, top_k: int = 20) -> Tuple[Any, Any]:
@@ -95,7 +94,7 @@ def compute_zipf_mandelbrot_params(v_logits: np.ndarray, top_k: int = 20) -> Tup
     cov_xy_ref = np.mean(y_cent * x_ref_cent, axis=-1)
     best_alphas = np.clip(-cov_xy_ref / (var_x_ref + 1e-12), 1e-4, 20.0)
 
-    return (best_alphas[0], best_betas[0]) if is_1d else (best_alphas, best_betas)
+    return (float(best_alphas[0]), float(best_betas[0])) if is_1d else (best_alphas, best_betas)
 
 
 def extract_array_trajectory_features(norm_pos: np.ndarray, array_vals: np.ndarray, feature_prefix: str, num_bins: int = 10) -> Dict[str, float]:
@@ -141,7 +140,10 @@ def extract_ranks_and_entropies_fast(v_logits: np.ndarray, v_labels: np.ndarray)
 
     raw_log_probs = log_probs[np.arange(T), v_labels]
     surprisals = -raw_log_probs
-    entropies = -np.sum(probs * log_probs, axis=-1)
+    
+    # Safe entropy computation preventing NaN from 0 * log(0)
+    safe_entropy_terms = np.where(probs > 0.0, -probs * log_probs, 0.0)
+    entropies = np.sum(safe_entropy_terms, axis=-1)
 
     target_logits = v_logits[np.arange(T), v_labels]
     ranks = np.empty(T, dtype=np.float64)
@@ -151,7 +153,7 @@ def extract_ranks_and_entropies_fast(v_logits: np.ndarray, v_labels: np.ndarray)
         end = min(start + chunk_size, T)
         ranks[start:end] = np.sum(v_logits[start:end] > target_logits[start:end, None], axis=-1) + 1
 
-    log_ranks = np.log(ranks)
+    log_ranks = np.log(np.maximum(ranks, 1.0))
     return raw_log_probs, surprisals, entropies, log_ranks, probs
 
 

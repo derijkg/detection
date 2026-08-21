@@ -3,13 +3,14 @@
 import json
 import os
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import joblib
 import nltk
 import numpy as np
 import pandas as pd
-import spacy
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from scipy.sparse import csr_matrix, hstack
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
@@ -30,9 +31,6 @@ nltk.download('stopwords', quiet=True)
 nltk.download('punkt', quiet=True)
 from nltk.corpus import stopwords
 
-from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
-import warnings
-
 warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
 
 _nlp = None
@@ -43,6 +41,7 @@ RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 def get_nlp():
     global _nlp
     if _nlp is None:
+        import spacy
         try:
             _nlp = spacy.load("nl_core_news_sm", disable=["parser", "ner"])
         except Exception:
@@ -80,9 +79,11 @@ class TextExtractor(BaseEstimator, TransformerMixin):
             records = X.to_dict(orient='records')
         elif isinstance(X, list) and len(X) > 0 and isinstance(X[0], dict):
             records = X
-        elif isinstance(X, list):
-            records = [{'text': str(t)} for t in X]
-        elif isinstance(X, np.ndarray):
+        elif isinstance(X, list) and len(X) == 0:
+            return []
+        elif isinstance(X, (list, np.ndarray)):
+            if len(X) == 0:
+                return []
             records = [{'text': str(t)} for t in X]
         else:
             records = [{'text': str(X)}]
@@ -129,9 +130,16 @@ class StylometricExtractor(BaseEstimator, TransformerMixin):
         elif isinstance(X, list) and len(X) > 0 and isinstance(X[0], dict):
             records = X
         elif isinstance(X, (list, np.ndarray)):
+            if len(X) == 0:
+                feat_dim = 11 if self.granularity == 'full' else 8
+                return np.empty((0, feat_dim), dtype=np.float32)
             records = [{'text': str(t)} for t in X]
         else:
             records = [{'text': str(X)}]
+
+        if not records:
+            feat_dim = 11 if self.granularity == 'full' else 8
+            return np.empty((0, feat_dim), dtype=np.float32)
 
         features = []
         for item in records:
@@ -434,15 +442,14 @@ class SVMDetector(BaseDetector):
             )
             self.pipeline = Pipeline([('features', feat_pipe), ('classifier', clf)])
 
-            if output_dir:
-                latex_dir = Path(output_dir) / "latex_tables"
-                latex_dir.mkdir(parents=True, exist_ok=True)
-                export_hyperparameters_table(
-                    best_params=best_params,
-                    search_spaces=TFIDFParamBuilder.SEARCH_SPACES,
-                    scope=self.scope,
-                    output_path=latex_dir / f"table_hyperparams_svm_{self.scope}.tex"
-                )
+            latex_dir = out_path / "latex_tables"
+            latex_dir.mkdir(parents=True, exist_ok=True)
+            export_hyperparameters_table(
+                best_params=best_params,
+                search_spaces=TFIDFParamBuilder.SEARCH_SPACES,
+                scope=self.scope,
+                output_path=latex_dir / f"table_hyperparams_svm_{self.scope}.tex"
+            )
 
         y = df_train["label"].astype(int).values
         X = df_train.to_dict(orient='records')

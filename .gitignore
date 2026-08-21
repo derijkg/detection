@@ -44,6 +44,7 @@ venv.bak/
 /data_static/preprocessed/betterdata/
 /data_static/preprocessed/stat_cache/
 /data_static/preprocessed/deberta_cache/
+/data_static/preprocessed/recipe_cache/
 
 # Binary data formats
 *.feather
