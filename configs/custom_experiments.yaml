@@ -3,68 +3,82 @@ seed: 42
 target_fpr: 0.01
 output_dir: "output"
 
+# Global data sample sizes (-1 = 100% full dataset, no subsampling)
+train_sample_size: -1
+dev_sample_size: -1
+
 # =========================================================================
-# REUSABLE DATA RECIPES
+# 1. REUSABLE DATA RECIPES
 # =========================================================================
 data_recipes:
-  # Training Split: Standard Sentences + Sentence-Tokenized Full Abstracts
+  # Training Split: Standard Sentences + Sentence-Tokenized Full AI Abstracts
   augmented_sentence_train:
     name: "augmented_sentence_train"
     splits: ["train"]
     include_standard_sentences: true
     include_full_abstract_sentences: true
-    sample_size: -1                     # Full training split
+    sample_size: -1                     # Use 100% of available training data
 
-  # Dev Split: Used for FPR calibration and Optuna early-stopping / validation
+  # Dev Split: Used for FPR threshold calibration & Optuna validation
   augmented_sentence_dev:
     name: "augmented_sentence_dev"
     splits: ["dev"]
     include_standard_sentences: true
     include_full_abstract_sentences: true
-    sample_size: -1                     # Full dev split
+    sample_size: -1                     # Use 100% of dev data
 
 # =========================================================================
-# EXPERIMENT SPECIFICATIONS
+# 2. EXPERIMENT SPECIFICATIONS
 # =========================================================================
 experiments:
-  # -----------------------------------------------------------------------
-  # 1. LINEAR SVM (TF-IDF + Stylometrics) on Augmented Sentence Data
-  # -----------------------------------------------------------------------
+  # =======================================================================
+  # EXPERIMENT 1: LINEAR SVM on Augmented Sentence Data
+  # Output folder: output/svm_sentence_abstracts_added
+  # =======================================================================
   - name: "svm_sentence_abstracts_added"
     model: "svm"
     scope: "sentence"
     train_recipe: "augmented_sentence_train"
     dev_recipe: "augmented_sentence_dev"
-    
-    # Tuning Configuration
-    tune: true
-    n_trials: 30
-    tuning_sample_size: 40000           # Stratified subsample for 3-fold Group CV
 
-    # Evaluation Test Suites
+    # Training & Dev Dataset Sizes for Final Fit
+    train_sample_size: -1               # 100% full training dataset
+    dev_sample_size: -1                 # 100% full dev dataset
+
+    # Optuna Hyperparameter Tuning Settings
+    tune: true
+    n_trials: 50                      
+    tuning_sample_size: 250000
+
+    # Benchmark Evaluations to Run After Training
     eval_benchmarks: ["sentence", "full"]
 
-  # -----------------------------------------------------------------------
-  # 2. mDeBERTa-v3 (CVaR-DRO) on Augmented Sentence Data
-  # -----------------------------------------------------------------------
+  # =======================================================================
+  # EXPERIMENT 2: mDeBERTa-v3 (CVaR-DRO) on Augmented Sentence Data
+  # Output folder: output/deberta_sentence_abstracts_added
+  # =======================================================================
   - name: "deberta_sentence_abstracts_added"
     model: "mdeberta"
     scope: "sentence"
     train_recipe: "augmented_sentence_train"
     dev_recipe: "augmented_sentence_dev"
-    
-    # Architecture & Optimization Knobs
+
+    # Training & Dev Dataset Sizes for Final Fit
+    train_sample_size: -1     
+    dev_sample_size: -1         
+
+    # Model Architecture & Optimization Hyperparameters
     max_length: 128
     batch_size: 32
     gradient_accumulation_steps: 1
-    epochs: 4
+    epochs: 4                           # Max ceiling (early stopping halts at peak pAUC)
     learning_rate: 3.0e-5
-    
-    # Optuna Tuning Configuration
-    tune: true
-    n_trials: 15
-    tuning_sample_size: 12000
-    val_sample_size: -1                 # Full dev split for validation during tuning
 
-    # Evaluation Test Suites
+    # Optuna Hyperparameter Tuning Settings
+    tune: true
+    n_trials: 15                        # 15 search trials
+    tuning_sample_size: 120000 
+    val_sample_size: -1 
+
+    # Benchmark Evaluations to Run After Training
     eval_benchmarks: ["sentence", "full"]

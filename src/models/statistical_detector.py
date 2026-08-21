@@ -23,6 +23,7 @@ class StatisticalTrajectoryDetector(BaseDetector):
         pipeline: Optional[Pipeline] = None,
         feature_names: Optional[List[str]] = None,
         scope: str = "full",
+        t_critical: float = 0.88,
         seed: int = 42,
         log_dir: Optional[Union[str, Path]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
@@ -31,15 +32,22 @@ class StatisticalTrajectoryDetector(BaseDetector):
         super().__init__(model_name="stat_trajectory", scope=scope, seed=seed, log_dir=log_dir)
         self.pipeline = pipeline
         self.feature_names = feature_names or []
+        self.t_critical = float(t_critical)
         self.cache_dir = Path(cache_dir or "data_static/preprocessed/stat_cache")
 
     def _ensure_feature_df(self, data: Union[pd.DataFrame, List[Dict[str, Any]]], split_tag: str = "custom") -> pd.DataFrame:
         df = pd.DataFrame(data)
-        stat_cols = [c for c in df.columns if any(k in c for k in ["surprisal", "entropy", "gini", "zipf", "log_prob", "step_"])]
-        if len(stat_cols) >= 5:
+        stat_cols = [c for c in df.columns if any(k in c for k in ["surprisal", "entropy", "gini", "zipf", "log_prob", "spec_heat", "elasticity"])]
+        if len(stat_cols) >= 8:
             return df
-        self.logger.info(f"Extracting/loading statistical trajectory features ({split_tag})...")
-        return extract_or_load_statistical_dataset(df, scope=self.scope, split_name=split_tag, cache_dir=self.cache_dir)
+        self.logger.info(f"Extracting/loading thermodynamic trajectory features ({split_tag}, Tc={self.t_critical:.2f})...")
+        return extract_or_load_statistical_dataset(
+            df, 
+            scope=self.scope, 
+            split_name=split_tag, 
+            cache_dir=self.cache_dir,
+            t_critical=self.t_critical
+        )
 
     def fit(self, train_data: Union[pd.DataFrame, List[Dict[str, Any]]], y_train: Optional[np.ndarray] = None, **kwargs) -> "StatisticalTrajectoryDetector":
         df = self._ensure_feature_df(train_data, split_tag="train")
@@ -57,7 +65,7 @@ class StatisticalTrajectoryDetector(BaseDetector):
         X = X.select_dtypes(include=[np.number]).fillna(0.0)
         self.feature_names = list(X.columns)
 
-        self.logger.info(f"Fitting Statistical Trajectory Classifier on {len(X)} samples ({len(self.feature_names)} features)...")
+        self.logger.info(f"Fitting Thermodynamic Trajectory Classifier on {len(X)} samples ({len(self.feature_names)} features)...")
 
         scaler = RobustScaler()
         clf = CalibratedClassifierCV(
@@ -88,7 +96,6 @@ class StatisticalTrajectoryDetector(BaseDetector):
         if set(self.feature_names).issubset(set(df_clean.columns)):
             X_vals = df_clean[self.feature_names].values
         else:
-            available = [c for c in self.feature_names if c in df_clean.columns]
             missing = [c for c in self.feature_names if c not in df_clean.columns]
             for m in missing:
                 df_clean[m] = 0.0
@@ -104,10 +111,11 @@ class StatisticalTrajectoryDetector(BaseDetector):
         meta = {
             "feature_names": self.feature_names,
             "scope": self.scope,
+            "t_critical": self.t_critical,
             "calibrated_threshold": self.calibrated_threshold
         }
         joblib.dump({"pipeline": self.pipeline, "metadata": meta}, save_p)
-        self.logger.info(f"Saved Statistical Trajectory Detector to: {save_p}")
+        self.logger.info(f"Saved Thermodynamic Trajectory Detector to: {save_p}")
 
     @classmethod
     def load(cls, path: Union[str, Path], scope: str = "full", seed: int = 42, log_dir: Optional[Path] = None, **kwargs) -> "StatisticalTrajectoryDetector":
@@ -122,6 +130,7 @@ class StatisticalTrajectoryDetector(BaseDetector):
             pipeline=data["pipeline"],
             feature_names=data["metadata"]["feature_names"],
             scope=scope,
+            t_critical=data["metadata"].get("t_critical", 0.88),
             seed=seed,
             log_dir=log_dir
         )

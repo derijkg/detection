@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # scripts/run_experiment.py
 
 import argparse
@@ -11,13 +10,13 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.data_loader import DetectionDataManager
-from src.data.dataset_recipe import RecipeDataBuilder, DatasetRecipe
+from src.data.data_loader import DataFilter, DetectionDataManager
+from src.data.dataset_recipe import DatasetRecipe, RecipeDataBuilder
 from src.evaluation.benchmark import BenchmarkOrchestrator
 from src.models.registry import (
     MODEL_METADATA,
-    get_detector_class,
     get_canonical_directory_name,
+    get_detector_class,
 )
 from src.utils.seed import set_seed
 from src.visualization.latex_tables import export_multi_model_comparison_table
@@ -32,7 +31,6 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def run_single_experiment(exp: Dict[str, Any], global_cfg: Dict[str, Any], builder: RecipeDataBuilder, manager: DetectionDataManager):
-    # Determine custom output folder: output/{experiment_name}
     exp_name = exp.get("name", exp.get("id", f"{exp['model']}_{exp.get('scope', 'custom')}"))
     out_root = Path(global_cfg.get("output_dir", "output"))
     out_dir = out_root / exp_name
@@ -103,9 +101,16 @@ def run_single_experiment(exp: Dict[str, Any], global_cfg: Dict[str, Any], build
         suite_dir = out_dir if len(eval_benchmarks) == 1 else (out_dir / f"eval_{eval_scope}")
         suite_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure threshold calibration uses dev data matching the evaluated target scope
+        if eval_scope == scope:
+            eval_dev_df = df_dev
+        else:
+            eval_dev_filter = DataFilter(splits=["dev"], scopes=[eval_scope])
+            eval_dev_df = manager.filter_dataframe(eval_dev_filter, sample_size=-1, seed=seed)
+
         BenchmarkOrchestrator.run_full_benchmark(
             model_pipeline=detector,
-            dev_df=df_dev,
+            dev_df=eval_dev_df,
             test_suites=test_suites,
             model_name=exp_name,
             scope=eval_scope,

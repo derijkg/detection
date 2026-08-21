@@ -1,12 +1,17 @@
 # src/evaluation/metrics.py
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import numpy as np
-from scipy.interpolate import interp1d
 from sklearn.metrics import (
-    average_precision_score, brier_score_loss, confusion_matrix,
-    f1_score, matthews_corrcoef, precision_score, recall_score,
-    roc_auc_score, roc_curve
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
 )
 
 
@@ -17,14 +22,27 @@ class MetricEvaluator:
         y_score: np.ndarray, 
         target_fpr: float = 0.01
     ) -> float:
-        """Interpolates True Positive Rate at exact target False Positive Rate."""
+        """
+        Interpolates True Positive Rate at exact target False Positive Rate
+        handling duplicate FPR values monotonically without scipy exceptions.
+        """
         y_true = np.asarray(y_true, dtype=int)
         y_score = np.asarray(y_score, dtype=float)
+        
         if len(np.unique(y_true)) < 2:
             return 0.0
+            
         fpr, tpr, _ = roc_curve(y_true, y_score)
-        interp_fn = interp1d(fpr, tpr, bounds_error=False, fill_value=(0.0, 1.0))
-        return float(interp_fn(target_fpr))
+        
+        # Deduplicate FPR taking the maximum achievable TPR at each unique FPR
+        unique_fpr, indices = np.unique(fpr, return_index=True)
+        max_tpr = np.zeros_like(unique_fpr)
+        for i, u_fpr in enumerate(unique_fpr):
+            max_tpr[i] = np.max(tpr[fpr == u_fpr])
+            
+        # Ensure strict monotonicity for interpolation
+        max_tpr = np.maximum.accumulate(max_tpr)
+        return float(np.interp(target_fpr, unique_fpr, max_tpr, left=0.0, right=1.0))
 
     @staticmethod
     def compute_metric(
@@ -39,7 +57,7 @@ class MetricEvaluator:
         y_score = np.asarray(y_score, dtype=float)
 
         if len(np.unique(y_true)) < 2:
-            return 0.5 if metric in ['pauc', 'roc_auc'] else 0.0
+            return 0.5 if metric in ['pauc', 'roc_auc', 'partial_auc'] else 0.0
 
         if metric in ['pauc', 'partial_auc', 'p_auc']:
             try:
@@ -62,7 +80,10 @@ class MetricEvaluator:
         y_pred = (y_score >= threshold).astype(int)
 
         if metric == 'mcc':
-            return float(matthews_corrcoef(y_true, y_pred))
+            try:
+                return float(matthews_corrcoef(y_true, y_pred))
+            except Exception:
+                return 0.0
         elif metric == 'f1':
             return float(f1_score(y_true, y_pred, pos_label=1, zero_division=0))
         elif metric == 'precision':
@@ -72,7 +93,6 @@ class MetricEvaluator:
             
         return float(roc_auc_score(y_true, y_score))
 
-
     @staticmethod
     def find_threshold_for_max_fpr(
         y_true: np.ndarray, 
@@ -80,21 +100,28 @@ class MetricEvaluator:
         target_fpr: float = 0.01
     ) -> float:
         """
-        Calculates a conservative decision threshold enforcing FPR <= target_fpr 
+        Calculates a conservative decision threshold enforcing empirical FPR <= target_fpr 
         on the negative (human) distribution without fractional boundary leakage.
         """
         y_true = np.asarray(y_true, dtype=int)
         y_score = np.asarray(y_score, dtype=float)
         
-        neg_scores = y_score[y_true == 0]
-        if len(neg_scores) == 0:
+        neg_scores = np.sort(y_score[y_true == 0])
+        n_neg = len(neg_scores)
+        if n_neg == 0:
             return 0.5
 
-        # 'higher' ensures the threshold is set to the actual observed score 
-        # at or above the quantile, strictly bounding FPR <= target_fpr
-        return float(np.quantile(neg_scores, 1.0 - target_fpr, method="higher"))
+        # Maximum allowed false positives
+        max_fp = int(np.floor(target_fpr * n_neg))
+        
+        if max_fp == 0:
+            # Strictest boundary: threshold is the maximum observed negative score
+            return float(neg_scores[-1])
+            
+        # Index corresponding to top max_fp tail
+        idx = max(0, n_neg - max_fp)
+        return float(neg_scores[idx])
 
-    
     @staticmethod
     def find_threshold_for_best_f1(
         y_true: np.ndarray, 
@@ -105,6 +132,9 @@ class MetricEvaluator:
         """
         y_true = np.asarray(y_true, dtype=int)
         y_score = np.asarray(y_score, dtype=float)
+
+        if len(y_score) == 0:
+            return 0.5
 
         threshold_candidates = np.unique(np.quantile(y_score, np.linspace(0.01, 0.99, 100)))
         best_f1 = -1.0
