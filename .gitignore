@@ -44,7 +44,8 @@ venv.bak/
 /data_static/preprocessed/betterdata/
 /data_static/preprocessed/stat_cache/
 /data_static/preprocessed/deberta_cache/
-
+/data_static/preprocessed/recipe_cache/
+/data_static/preprocessed/svm_cache/
 # Binary data formats
 *.feather
 *.h5
@@ -104,3 +105,4 @@ export.py
 codebase_dump.md
 evaluation_summary.json
 profile_data.py
+/experiments/
