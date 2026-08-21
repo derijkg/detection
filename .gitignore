@@ -1,66 +1,95 @@
-outputs/
-old/
+# =====================================================================
+# 1. Python Environment & Bytecode
+# =====================================================================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-.pytest_cache/
-.mypy_cache/
-extra/
-evals/
-
-
-
-Because you have heavy files (like .safetensors, .arrow, .parquet, and .joblib), running git add -A right now without an updated .gitignore would blow up your Git history size to tens of gigabytes and freeze Git.
-
-Here is the bulletproof, 4-step way to safely preserve everything and start a clean refactored branch.
-Step 1: Make a Physical Backup on the Server (100% Fail-Safe)
-
-First, make a direct disk-level copy of your entire folder on calc12. This guarantees you cannot lose a single file or intermediate result no matter what happens in Git:
-code Bash
-
-# Run this from your home directory (~/)
-cd ~
-cp -r detection detection_backup_full
-cd detection
-
-Step 2: Put the .gitignore in Place First
-
-Create/overwrite your .gitignore right now before making any branch commits. This tells Git to save all your old code and scripts, but ignore the heavy binaries:
-code Bash
-
-cat << 'EOF' > .gitignore
-# Heavy data, features and caches
-data_static/
-data/
+# =====================================================================
+# 2. Large Datasets & Static Storage (Root Anchored)
+# =====================================================================
+/data_static/
+/data/
 *.parquet
-*.csv
-*.arrow
-*.joblib
-*.db
-*.sqlite3
+*.feather
+*.h5
+*.hdf5
 
-# Model weights & Checkpoints
-outputs*/
-output/
-optuna_trials/
+# =====================================================================
+# 3. Model Weights & Binary Checkpoints
+# =====================================================================
 checkpoints/
-models/
-*.safetensors
+checkpoints_tmp/
+best_model/
+*.joblib
+*.pkl
 *.bin
 *.pt
 *.pth
+*.safetensors
+*.gguf
 
-# Python & Environment
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.ipynb_checkpoints/
+# =====================================================================
+# 4. Outputs, Logs & Optuna Database Storage (Root Anchored)
+# =====================================================================
+/output/
+/output_new/
+/output_tmp/
+/logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.tmp_optuna*
 wandb/
+evals/
+old/
 
-# Local workspace
-legacy/
-scratch/
-EOF
+# =====================================================================
+# 5. IDEs, OS & Jupyter Artifacts
+# =====================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+
+export.py
+codebase_dump.md
+evaluation_summary.json

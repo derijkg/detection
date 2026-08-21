@@ -1,47 +1,57 @@
-# detection/src/data/synth_data.py
+# src/data/synth_data.py
 
 import ast
 import json
 import random
+import unicodedata
 import zlib
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Tuple, Optional, Set
 
-# String values to strictly reject during parsing
+# Failed generation markers and invalid strings
+FAILED_GENERATION_VALUES: Set[str] = {"generation_failed", "failed_generation"}
+FAILED_VALIDATION_VALUES: Set[str] = {"validation_failed", "failed_validation"}
 INVALID_SENTENCE_VALUES: Set[str] = {
-    "generation_failed",
-    "validation_failed",
-    "nan",
-    "none",
-    "null",
-    "",
-}
+    "nan", "none", "null", ""
+} | FAILED_GENERATION_VALUES | FAILED_VALIDATION_VALUES
 
 
 def is_valid_sentence(text: Any) -> bool:
-    """
-    Checks whether a sentence is valid and free of failure markers, NaNs, or empty strings.
-    """
+    """Checks whether a text string is valid, non-empty, and free of sentinel error keywords."""
     if text is None:
         return False
     if isinstance(text, (float, np.floating)) and np.isnan(text):
         return False
-    
+    if isinstance(text, (list, tuple, np.ndarray)) and len(text) == 0:
+        return False
+
     clean_str = str(text).strip()
     if not clean_str:
         return False
-    
-    if clean_str.lower() in INVALID_SENTENCE_VALUES:
+
+    clean_lower = clean_str.lower()
+    if any(clean_lower.startswith(v) for v in FAILED_GENERATION_VALUES | FAILED_VALIDATION_VALUES):
         return False
-    
+    if clean_lower in INVALID_SENTENCE_VALUES:
+        return False
+
     return True
+
+def normalize_sentence(text: Any) -> str:
+    """Normalizes Unicode NFKC and strips whitespace."""
+    if not is_valid_sentence(text):
+        return ""
+    text_str = str(text)
+    text_str = unicodedata.normalize("NFKC", text_str)
+    return " ".join(text_str.split()).strip()
 
 
 def parse_and_clean_sentence_array(raw_val: Any) -> List[str]:
     """
-    Safely parses raw values (numpy arrays, python lists, stringified arrays)
-    and strips out invalid/failed values.
+    Safely parses raw values (numpy arrays, lists, JSON strings, stringified python arrays)
+    and removes failed sentinel values.
     """
     if raw_val is None:
         return []
@@ -67,19 +77,18 @@ def parse_and_clean_sentence_array(raw_val: Any) -> List[str]:
         elif val_str:
             parsed_list = [val_str]
 
-    # Filter out invalid, failed, or NaN strings
+    # Filter and clean sentences
     cleaned_sentences = [
-        str(s).strip() 
-        for s in parsed_list 
+        normalize_sentence(s)
+        for s in parsed_list
         if is_valid_sentence(s)
     ]
-
-    return cleaned_sentences
+    return [s for s in cleaned_sentences if s]
 
 
 def extract_valid_single_models(
-    row: pd.Series, 
-    model_columns: Optional[List[str]] = None
+    row: pd.Series,
+    min_sentences: int = 4
 ) -> Dict[str, List[str]]:
     """
     Extracts and validates sentence arrays for all model '_single' columns present in a row.
@@ -87,18 +96,16 @@ def extract_valid_single_models(
     """
     valid_model_sents: Dict[str, List[str]] = {}
 
-    # Find candidate single-sentence columns if not explicitly provided
-    if model_columns is None:
-        model_columns = [col for col in row.index if col.endswith("_single")]
-
-    for col in model_columns:
-        if col not in row or pd.isna(row[col]):
+    for col in row.index:
+        if not col.endswith("_single") and not col.endswith("_sentence"):
+            continue
+        if pd.isna(row[col]):
             continue
 
         clean_sents = parse_and_clean_sentence_array(row[col])
-        if clean_sents:
-            # Extract model name from column name (e.g. 'qwen3.6:27b_single' -> 'qwen3.6:27b')
-            model_name = col.rsplit("_single", 1)[0]
+        if len(clean_sents) >= min_sentences:
+            suffix = "_single" if col.endswith("_single") else "_sentence"
+            model_name = col.rsplit(suffix, 1)[0]
             valid_model_sents[model_name] = clean_sents
 
     return valid_model_sents
@@ -111,7 +118,7 @@ def mix_abstract_at_ratio(
     seed: int
 ) -> Tuple[List[str], List[int], List[str], float]:
     """
-    Substitutes target_ratio % of human sentences with corresponding LLM sentences from random models.
+    Substitutes target_ratio % of human sentences with corresponding LLM sentences from available models.
 
     Returns:
         mixed_sentences (List[str]): Reconstituted sentence list.
@@ -119,148 +126,96 @@ def mix_abstract_at_ratio(
         sentence_models (List[str]): Author/model name for each sentence.
         actual_ratio (float): Actual substituted ratio achieved.
     """
-    n_sentences = len(human_sents)
-    
-    # Calculate number of sentences to replace (k)
-    k = int(round(target_ratio * n_sentences))
-    # Clamp k between 1 and n_sentences - 1 to guarantee a mix if n_sentences >= 2
-    k = max(1, min(n_sentences - 1, k))
+    # Align to minimum available sentence length across models to prevent out-of-bounds or repetition
+    min_len = min(len(human_sents), min(len(sents) for sents in available_models.values()))
+    if min_len < 4:
+        return [], [], [], 0.0
 
-    # Set deterministic RNG per doc and ratio
+    h_aligned = human_sents[:min_len]
+
+    # Number of sentences to replace (k), bounded to guarantee true partial mixture
+    k = int(round(target_ratio * min_len))
+    k = max(1, min(min_len - 1, k))
+
     rng = random.Random(seed)
-
-    # Pick indices for replacement
-    replace_indices = set(rng.sample(range(n_sentences), k))
+    replace_indices = set(rng.sample(range(min_len), k))
+    model_names = sorted(list(available_models.keys()))
 
     mixed_sents: List[str] = []
     sentence_labels: List[int] = []
     sentence_models: List[str] = []
 
-    model_names = list(available_models.keys())
-
-    for i in range(n_sentences):
+    for i in range(min_len):
         if i in replace_indices:
-            # Pick a random model that has a valid rewrite
             chosen_model = rng.choice(model_names)
-            model_sents = available_models[chosen_model]
-            
-            # Use corresponding index if available, else fallback safely via modulo
-            llm_sent = model_sents[i] if i < len(model_sents) else model_sents[i % len(model_sents)]
-            
+            llm_sent = available_models[chosen_model][i]
             mixed_sents.append(llm_sent)
             sentence_labels.append(1)
             sentence_models.append(chosen_model)
         else:
-            mixed_sents.append(human_sents[i])
+            mixed_sents.append(h_aligned[i])
             sentence_labels.append(0)
             sentence_models.append("human")
 
-    actual_ratio = k / n_sentences if n_sentences > 0 else 0.0
+    actual_ratio = k / min_len
     return mixed_sents, sentence_labels, sentence_models, actual_ratio
 
 
-def generate_synthetic_mixes(
-    df: pd.DataFrame,
+def generate_synthetic_rows_for_doc(
+    row: pd.Series,
     target_ratios: List[float] = [0.25, 0.50, 0.75],
     seed: int = 42,
-    min_sentences: int = 3
-) -> pd.DataFrame:
-    """
-    Generates synthetic mixed-authorship documents at target ratios (25%, 50%, 75%)
-    for all abstracts in the DataFrame.
+    min_sentences: int = 4
+) -> List[Dict[str, Any]]:
+    doc_id = str(row.get("_id", row.get("doc_id", row.get("id", "unknown"))))
+    split = row.get("split", "test")
+    source = row.get("source", "unknown")
+    keywords = row.get("keywords", None)
+    year = row.get("year", None)
 
-    Returns a long-format DataFrame ready for model training and benchmark evaluation.
-    """
-    synthetic_records: List[Dict[str, Any]] = []
-    print(f"Generating synthetic mixed abstracts for {len(df)} rows...")
+    raw_human_sents = row.get("abstract_sentence") or row.get("abstract_sentences") or []
+    human_sents = parse_and_clean_sentence_array(raw_human_sents)
+    if len(human_sents) < min_sentences:
+        return []
 
-    for idx, row in df.iterrows():
-        # Get abstract identifier
-        doc_id = str(row["_id"]) if "_id" in row and pd.notna(row["_id"]) else f"doc_{idx}"
-        source = str(row.get("source", "unknown"))
-        keywords = row.get("keywords", None)
-        year = row.get("year", None)
+    valid_models = extract_valid_single_models(row, min_sentences=min_sentences)
+    if not valid_models:
+        return []
 
-        # 1. Parse and clean human abstract sentences
-        human_sents = parse_and_clean_sentence_array(row.get("abstract_sentence", []))
-        if len(human_sents) < min_sentences:
+    synthetic_rows = []
+    for ratio in target_ratios:
+        seed_str = f"{seed}_{doc_id}_{ratio}"
+        pair_seed = zlib.crc32(seed_str.encode("utf-8"))
+
+        mixed_sents, s_labels, s_models, actual_ratio = mix_abstract_at_ratio(
+            human_sents=human_sents,
+            available_models=valid_models,
+            target_ratio=ratio,
+            seed=pair_seed
+        )
+
+        if not mixed_sents:
             continue
 
-        # 2. Extract and clean available single-sentence LLM rewrites
-        valid_models = extract_valid_single_models(row)
-        if not valid_models:
-            continue
+        reconstituted_text = " ".join(mixed_sents)
 
-        # 3. Generate 25%, 50%, 75% synthetic reconstitutions
-        for ratio in target_ratios:
-            # Deterministic seed per abstract and target ratio
-            seed_str = f"{seed}_{doc_id}_{ratio}"
-            pair_seed = zlib.crc32(seed_str.encode("utf-8"))
+        synthetic_rows.append({
+            "_id": doc_id,
+            "source": source,
+            "keywords": keywords,
+            "year": year,
+            "split": split,
+            "text": reconstituted_text,
+            "label": 1,
+            "llm_ratio": actual_ratio,
+            "target_ratio": ratio,
+            "model_name": "synthetic_multi",
+            "scope": "full",
+            "generation_type": "synthetic_partial",
+            "sentences": mixed_sents,
+            "sentence_labels": s_labels,
+            "sentence_models": s_models,
+            "num_sentences": len(mixed_sents)
+        })
 
-            mixed_sents, labels, sentence_models, actual_ratio = mix_abstract_at_ratio(
-                human_sents=human_sents,
-                available_models=valid_models,
-                target_ratio=ratio,
-                seed=pair_seed
-            )
-
-            reconstituted_text = " ".join(mixed_sents)
-
-            synthetic_records.append({
-                "_id": doc_id,
-                "source": source,
-                "keywords": keywords,
-                "year": year,
-                "text": reconstituted_text,
-                "label": 1,  # Mixed document
-                "llm_ratio": actual_ratio,
-                "target_ratio": ratio,
-                "model_name": "synthetic_multi",
-                "scope": "full",
-                "generation_type": "synthetic_partial",
-                "sentences": mixed_sents,
-                "sentence_labels": labels,
-                "sentence_models": sentence_models,
-                "num_sentences": len(mixed_sents)
-            })
-
-    synth_df = pd.DataFrame(synthetic_records)
-    print(f"-> Successfully generated {len(synth_df)} synthetic mixed document records.")
-    return synth_df
-
-
-if __name__ == "__main__":
-    # Example usage / smoke test
-    sample_raw_df = pd.DataFrame([
-        {
-            "_id": "abs_001",
-            "source": "arxiv",
-            "keywords": ["AI", "Detection"],
-            "year": 2024,
-            "abstract_sentence": np.array([
-                "This paper presents a new detector.",
-                "We evaluate it on multiple datasets.",
-                "Our results demonstrate high accuracy.",
-                "GENERATION_FAILED",  # Will be cleanly filtered out
-                "Finally, we discuss future work."
-            ]),
-            "qwen3.6:27b_single": np.array([
-                "This study introduces a novel detection model.",
-                "We test the framework across diverse benchmarks.",
-                "Our findings show exceptional performance.",
-                "VALIDATION_FAILED",  # Will be cleanly filtered out
-                "In conclusion, potential future directions are explored."
-            ]),
-            "gemma4:e4b_single": np.array([
-                "Here, we propose an improved detector method.",
-                "Evaluations were conducted on various datasets.",
-                "The outcomes highlight strong predictive accuracy.",
-                "None",  # Will be cleanly filtered out
-                "Lastly, future research avenues are considered."
-            ])
-        }
-    ])
-
-    synthetic_df = generate_synthetic_mixes(sample_raw_df)
-    print("\nSample Output Row:")
-    print(synthetic_df[['_id', 'target_ratio', 'llm_ratio', 'text']].to_string())
+    return synthetic_rows

@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 import pandas as pd
 import numpy as np
 
-# Calculate project root dynamically (~/detection)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data_static" / "preprocessed" / "preprocessed_dataset.parquet"
 DEFAULT_FEATURES_DIR = PROJECT_ROOT / "data_static" / "model_features"
@@ -51,8 +50,16 @@ class TextSample:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TextSample":
+        year_val = d.get("year")
+        parsed_year = None
+        if year_val is not None and not pd.isna(year_val):
+            try:
+                parsed_year = int(float(year_val))
+            except (ValueError, TypeError):
+                parsed_year = None
+
         return cls(
-            id=str(d.get("_id", d.get("id", ""))),
+            id=str(d.get("_id", d.get("id", d.get("doc_id", "")))),
             text=str(d.get("text", "")),
             label=int(d.get("label", 0)),
             llm_ratio=float(d.get("llm_ratio", 0.0)),
@@ -62,7 +69,7 @@ class TextSample:
             split=str(d.get("split", "train")),
             source=d.get("source"),
             keywords=d.get("keywords"),
-            year=d.get("year")
+            year=parsed_year
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -77,39 +84,7 @@ class DataFilter:
     model_names: Optional[List[str]] = None
     llm_ratios: Optional[List[float]] = None
     labels: Optional[List[int]] = None
-
-
-if HAS_TORCH:
-    class PyTorchDetectionDataset(TorchDataset):
-        def __init__(self, samples: List[TextSample], tokenizer: Optional[Any] = None, max_length: int = 256):
-            self.samples = samples
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-
-        def __len__(self) -> int:
-            return len(self.samples)
-
-        def __getitem__(self, idx: int) -> Dict[str, Any]:
-            sample = self.samples[idx]
-            item = {
-                "id": sample.id,
-                "text": sample.text,
-                "label": torch.tensor(sample.label, dtype=torch.long),
-                "llm_ratio": torch.tensor(sample.llm_ratio, dtype=torch.float),
-                "model_name": sample.model_name,
-                "scope": sample.scope,
-                "generation_type": sample.generation_type,
-                "split": sample.split
-            }
-
-            if self.tokenizer is not None:
-                encoded = self.tokenizer(
-                    sample.text, padding="max_length", truncation=True, 
-                    max_length=self.max_length, return_tensors="pt"
-                )
-                item["input_ids"] = encoded["input_ids"].squeeze(0)
-                item["attention_mask"] = encoded["attention_mask"].squeeze(0)
-            return item
+    test_suite: Optional[str] = None  # 'standard', 'prompt_partial', 'synthetic_multi', 'all'
 
 
 class DetectionDataManager:
@@ -130,7 +105,13 @@ class DetectionDataManager:
     def raw_dataframe(self) -> pd.DataFrame:
         return self._df
 
-    def filter_dataframe(self, filter_config: Optional[DataFilter] = None, sample_size: int = -1, seed: int = 42, **kwargs) -> pd.DataFrame:
+    def filter_dataframe(
+        self, 
+        filter_config: Optional[DataFilter] = None, 
+        sample_size: int = -1, 
+        seed: int = 42, 
+        **kwargs
+    ) -> pd.DataFrame:
         if filter_config is None:
             filter_config = DataFilter(**kwargs)
         else:
@@ -140,12 +121,14 @@ class DetectionDataManager:
 
         df = self._df.copy()
 
+        # 1. Splits
         if filter_config.splits:
             requested_splits = set(filter_config.splits)
             if 'dev' in requested_splits or 'val' in requested_splits:
                 requested_splits.update(['dev', 'val'])
             df = df[df['split'].isin(requested_splits)]
             
+        # 2. Scopes
         if filter_config.scopes:
             normalized_scopes = []
             for s in filter_config.scopes:
@@ -155,22 +138,33 @@ class DetectionDataManager:
                     normalized_scopes.append(s)
             df = df[df['scope'].isin(normalized_scopes)]
 
+        # 3. Predefined Test Suite Presets
+        if filter_config.test_suite:
+            mode = filter_config.test_suite.lower()
+            if mode == 'standard':
+                df = df[df['generation_type'].isin(['human_full', 'human_sentence', 'full_rewrite', 'sentence_rewrite'])]
+            elif mode == 'prompt_partial':
+                df = df[df['generation_type'].isin(['human_full', 'human_sentence', 'full_rewrite', 'sentence_rewrite', 'prompt_partial'])]
+            elif mode == 'synthetic_multi':
+                df = df[df['generation_type'].isin(['human_full', 'human_sentence', 'full_rewrite', 'sentence_rewrite', 'synthetic_partial'])]
+
+        # 4. Explicit generation types & models
         if filter_config.generation_types:
             df = df[df['generation_type'].isin(filter_config.generation_types)]
         if filter_config.model_names:
-            df = df[df['model_name'].isin(filter_config.model_names)]
+            df = df[df['model_name'].isin(filter_config.model_names) | (df['model_name'] == 'human')]
         if filter_config.llm_ratios:
             ratios_arr = np.array(filter_config.llm_ratios)
             df = df[df['llm_ratio'].apply(lambda r: any(np.isclose(r, ratios_arr)))]
         if filter_config.labels:
             df = df[df['label'].isin(filter_config.labels)]
 
-        # Group-Stratified Subsampling on _id
+        # 5. Group-Stratified Subsampling on _id
         if sample_size > 0 and len(df) > sample_size:
-            id_col = '_id' if '_id' in df.columns else ('doc_id' if 'doc_id' in df.columns else 'id')
-            if id_col in df.columns:
+            id_col = next((c for c in ['_id', 'doc_id', 'id'] if c in df.columns), None)
+            if id_col:
                 unique_ids = df[id_col].unique()
-                avg_rows = len(df) / len(unique_ids)
+                avg_rows = len(df) / max(len(unique_ids), 1)
                 target_groups = max(1, int(sample_size / avg_rows))
                 
                 if target_groups < len(unique_ids):
@@ -182,20 +176,48 @@ class DetectionDataManager:
 
         return df
 
+    def get_benchmark_test_suites(self, scope: str = "full") -> Dict[str, Any]:
+        test_base = self.filter_dataframe(DataFilter(splits=['test'], scopes=[scope]))
+        
+        suites = {
+            "standard": self.filter_dataframe(DataFilter(splits=['test'], scopes=[scope], test_suite='standard')),
+            "prompt_partial": self.filter_dataframe(DataFilter(splits=['test'], scopes=[scope], test_suite='prompt_partial')),
+            "synthetic_multi": self.filter_dataframe(DataFilter(splits=['test'], scopes=[scope], test_suite='synthetic_multi')),
+            "all": test_base,
+            "per_generator": {}
+        }
+
+        # Slices for individual generator LLMs
+        models_in_test = [m for m in test_base['model_name'].unique() if m not in ['human', 'synthetic_multi']]
+        for m in models_in_test:
+            suites["per_generator"][m] = test_base[test_base['model_name'].isin(['human', m])].copy()
+
+        return suites
+
     def get_samples(self, filter_config: Optional[DataFilter] = None, **kwargs) -> List[TextSample]:
         filtered_df = self.filter_dataframe(filter_config, **kwargs)
         return [TextSample.from_dict(row) for row in filtered_df.to_dict(orient="records")]
 
     def get_sklearn_data(self, filter_config: Optional[DataFilter] = None, **kwargs) -> Tuple[List[str], List[int]]:
         filtered_df = self.filter_dataframe(filter_config, **kwargs)
-        return filtered_df['text'].tolist(), filtered_df['label'].tolist()
+        texts = filtered_df['text'].fillna("").astype(str).tolist()
+        labels = filtered_df['label'].astype(int).tolist()
+        return texts, labels
 
     def get_hf_dataset(self, filter_config: Optional[DataFilter] = None, **kwargs):
         if not HAS_HF:
             raise ImportError("Hugging Face `datasets` library required.")
-        filtered_df = self.filter_dataframe(filter_config, **kwargs)
         
-        if filter_config is None or filter_config.splits is None:
+        if filter_config is None:
+            filter_config = DataFilter(**kwargs)
+        else:
+            for k, v in kwargs.items():
+                if hasattr(filter_config, k) and v is not None:
+                    setattr(filter_config, k, v)
+
+        filtered_df = self.filter_dataframe(filter_config)
+        
+        if filter_config.splits is None:
             dataset_dict = {}
             for split_name in filtered_df['split'].unique():
                 split_df = filtered_df[filtered_df['split'] == split_name]
@@ -203,99 +225,3 @@ class DetectionDataManager:
             return DatasetDict(dataset_dict)
         else:
             return HFDataset.from_pandas(filtered_df, preserve_index=False)
-
-    def get_tokenized_dataset(
-        self,
-        scope: str,
-        split: str,
-        tokenizer: Optional[Union[str, Any]] = "microsoft/mdeberta-v3-base",
-        max_length: int = 512,
-        padding: Union[bool, str] = "max_length",
-        model_prefix: str = "deberta",
-        force_reprocess: bool = False,
-        return_format: Optional[str] = "torch",
-    ):
-        if not HAS_HF:
-            raise ImportError("Hugging Face `datasets` library required.")
-
-        cache_dir = self.features_dir / f"{model_prefix}_{scope}" / f"{split}_tokenized"
-
-        # Load from disk if present
-        if cache_dir.exists() and any(cache_dir.iterdir()) and not force_reprocess:
-            print(f"[Cache Hit] Loading pretokenized dataset: {cache_dir}")
-            ds = load_from_disk(str(cache_dir))
-            if return_format and HAS_TORCH:
-                ds.set_format(type=return_format)
-            return ds
-
-        print(f"[Cache Miss] Pretokenizing split [{scope} | {split}]...")
-
-        # Get filtered dataset
-        split_query = [split]
-        if split in ["dev", "val"]:
-            split_query = ["dev", "val"]
-
-        hf_ds = self.get_hf_dataset(DataFilter(splits=split_query, scopes=[scope]))
-        if len(hf_ds) == 0:
-            raise ValueError(f"No samples found for scope='{scope}' and split='{split}'.")
-
-        # Resolve tokenizer
-        if isinstance(tokenizer, str):
-            if not HAS_TRANSFORMERS:
-                raise ImportError("`transformers` library required to load tokenizer by name.")
-            tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
-        elif tokenizer is not None:
-            tokenizer_obj = tokenizer
-        else:
-            raise ValueError("Must provide tokenizer instance or name.")
-
-        # Map tokenization
-        def _tokenize_fn(batch):
-            return tokenizer_obj(
-                batch["text"],
-                padding=padding,
-                truncation=True,
-                max_length=max_length
-            )
-
-        tokenized_ds = hf_ds.map(
-            _tokenize_fn,
-            batched=True,
-            desc=f"Tokenizing {model_prefix}_{scope}/{split}_tokenized"
-        )
-
-        # Save pretokenized cache to disk
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        tokenized_ds.save_to_disk(str(cache_dir))
-        print(f"[Saved Cache] Tokenized dataset saved to: {cache_dir}")
-
-        if return_format and HAS_TORCH:
-            tokenized_ds.set_format(type=return_format)
-
-        return tokenized_ds
-
-    def build_all_tokenized_caches(
-        self,
-        scopes: List[str] = ["full", "sentence"],
-        splits: List[str] = ["train", "dev", "test"],
-        tokenizer: Union[str, Any] = "microsoft/mdeberta-v3-base",
-        max_length: int = 512,
-        model_prefix: str = "deberta",
-        force_reprocess: bool = False
-    ) -> Dict[str, Any]:
-        tokenized_dict = {}
-        for scope in scopes:
-            for split in splits:
-                try:
-                    key = f"{scope}_{split}"
-                    tokenized_dict[key] = self.get_tokenized_dataset(
-                        scope=scope,
-                        split=split,
-                        tokenizer=tokenizer,
-                        max_length=max_length,
-                        model_prefix=model_prefix,
-                        force_reprocess=force_reprocess
-                    )
-                except ValueError as e:
-                    print(f"Skipping ({scope}, {split}): {e}")
-        return tokenized_dict

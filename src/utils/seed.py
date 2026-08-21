@@ -1,4 +1,4 @@
-# detection/src/utils/seed.py
+# src/utils/seed.py
 
 import os
 import random
@@ -13,7 +13,7 @@ except ImportError:
 
 def set_seed(seed: int = 42) -> None:
     """
-    Sets global random seeds for Python, NumPy, and PyTorch to ensure reproducibility.
+    Sets deterministic seeds across Python, NumPy, PyTorch (CPU & CUDA), and cuDNN.
     """
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)

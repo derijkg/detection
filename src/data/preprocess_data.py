@@ -1,25 +1,37 @@
-# detection/src/data/preprocess_data.py
+# src/data/preprocess_data.py
 
 import os
 import re
-import ast
-import json
-import zlib
-import random
 import unicodedata
 from pathlib import Path
-from typing import Any, List, Dict, Tuple, Set, Optional
+from typing import Any, Dict, List, Optional, Set
 
-import pandas as pd
+from bs4 import BeautifulSoup
 import numpy as np
-from sklearn.model_selection import GroupShuffleSplit
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
 
 # Project-relative pathing
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 INPUT_PATH = PROJECT_ROOT / "data_static" / "raw" / "llm_added.parquet"
 OUTPUT_DIR = PROJECT_ROOT / "data_static" / "preprocessed"
 
+# Import modularized synthetic data generator and sentence parser
+from src.data.synth_data import (
+    generate_synthetic_rows_for_doc,
+    parse_and_clean_sentence_array,
+    is_valid_sentence as synth_is_valid_sentence
+)
+
 NON_PRINTABLE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+RE_MD_IMG = re.compile(r"!\[(.*?)\]\(.*?\)")
+RE_MD_LINK = re.compile(r"\[(.*?)\]\(.*?\)")
+RE_MD_BOLD = re.compile(r"(\*\*|__)(.*?)\1")
+RE_MD_ITALIC = re.compile(r"(\*|_)(.*?)\1")
+RE_MD_STRIKE = re.compile(r"(~~)(.*?)\1")
+RE_MD_CODE = re.compile(r"(`)(.*?)\1")
+RE_MD_HEADER = re.compile(r"^\s*[#>]+\s+", flags=re.MULTILINE)
+RE_MD_HR = re.compile(r"^\s*[-*_]{3,}\s*$", flags=re.MULTILINE)
 
 FAILED_GENERATION_VALUES: Set[str] = {"generation_failed", "failed_generation"}
 FAILED_VALIDATION_VALUES: Set[str] = {"validation_failed", "failed_validation"}
@@ -41,16 +53,44 @@ def is_none_or_nan(val: Any) -> bool:
         return False
 
 
+def strip_markdown(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = RE_MD_IMG.sub(r"\1", text)
+    text = RE_MD_LINK.sub(r"\1", text)
+    text = RE_MD_BOLD.sub(r"\2", text)
+    text = RE_MD_ITALIC.sub(r"\2", text)
+    text = RE_MD_STRIKE.sub(r"\2", text)
+    text = RE_MD_CODE.sub(r"\2", text)
+    text = RE_MD_HEADER.sub("", text)
+    text = RE_MD_HR.sub("", text)
+    return text
+
+
+def clean_html_markdown(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        text = soup.get_text(separator=" ")
+    except Exception:
+        pass
+    return strip_markdown(text)
+
+
 def normalize_text(text: Any) -> str:
     if is_none_or_nan(text) or isinstance(text, (list, tuple, np.ndarray)):
         return ""
-    text_str = str(text)
+    text_str = clean_html_markdown(str(text))
     text_str = unicodedata.normalize("NFKC", text_str)
     text_str = NON_PRINTABLE_RE.sub("", text_str)
-    return text_str.strip()
+    text_str = text_str.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    text_str = text_str.replace("—", "-").replace("–", "-")
+    return " ".join(text_str.split()).strip()
 
 
-def is_valid_sentence(text: Any, counts: Optional[Dict[str, int]] = None) -> bool:
+def check_and_count_validity(text: Any, counts: Optional[Dict[str, int]] = None) -> bool:
+    """Validates text while updating filter diagnostic metrics."""
     if is_none_or_nan(text) or isinstance(text, (list, tuple, np.ndarray)):
         if counts is not None:
             counts["null_or_empty"] += 1
@@ -63,12 +103,12 @@ def is_valid_sentence(text: Any, counts: Optional[Dict[str, int]] = None) -> boo
         return False
 
     clean_lower = clean_str.lower()
-    if clean_lower in FAILED_GENERATION_VALUES:
+    if any(clean_lower.startswith(v) for v in FAILED_GENERATION_VALUES):
         if counts is not None:
             counts["failed_generation"] += 1
         return False
 
-    if clean_lower in FAILED_VALIDATION_VALUES:
+    if any(clean_lower.startswith(v) for v in FAILED_VALIDATION_VALUES):
         if counts is not None:
             counts["failed_validation"] += 1
         return False
@@ -81,217 +121,178 @@ def is_valid_sentence(text: Any, counts: Optional[Dict[str, int]] = None) -> boo
     return True
 
 
-def parse_and_clean_sentence_array(raw_val: Any, counts: Optional[Dict[str, int]] = None) -> List[str]:
-    if is_none_or_nan(raw_val):
-        return []
-    parsed_list: List[Any] = []
-    if isinstance(raw_val, (list, tuple, np.ndarray)):
-        parsed_list = list(raw_val)
-    elif isinstance(raw_val, str):
-        val_str = raw_val.strip()
-        if val_str.startswith("[") and val_str.endswith("]"):
-            try:
-                parsed = ast.literal_eval(val_str)
-                parsed_list = list(parsed) if isinstance(parsed, (list, tuple, np.ndarray)) else [str(parsed)]
-            except (ValueError, SyntaxError):
-                try:
-                    parsed = json.loads(val_str)
-                    parsed_list = list(parsed) if isinstance(parsed, (list, tuple, np.ndarray)) else [str(parsed)]
-                except Exception:
-                    parsed_list = [val_str]
-        elif val_str:
-            parsed_list = [val_str]
+def create_id_splits(
+    df: pd.DataFrame,
+    id_col: Optional[str] = None,
+    stratify_col: Optional[str] = "source",
+    train_ratio: float = 0.70,
+    dev_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    random_state: int = 42
+) -> Dict[Any, str]:
+    """
+    Creates Group-Isolated AND Source-Stratified splits across unique document IDs.
+    """
+    if id_col is None or id_col not in df.columns:
+        id_col = next((c for c in ["_id", "doc_id", "id"] if c in df.columns), df.columns[0])
 
-    cleaned = []
-    for item in parsed_list:
-        if is_valid_sentence(item, counts=counts):
-            cleaned.append(normalize_text(item))
-    return cleaned
+    if stratify_col and stratify_col in df.columns:
+        doc_meta = df[[id_col, stratify_col]].drop_duplicates(subset=[id_col]).reset_index(drop=True)
+        unique_ids = doc_meta[id_col].values
+        raw_strata = doc_meta[stratify_col].fillna("unknown").astype(str).values
+        
+        # Merge rare stratum categories (< 3 samples) into 'other' to prevent StratifiedKFold failures
+        val_counts = pd.Series(raw_strata).value_counts()
+        rare_classes = set(val_counts[val_counts < 3].index)
+        strata = np.array(["other" if s in rare_classes else s for s in raw_strata])
+    else:
+        unique_ids = df[id_col].unique()
+        strata = np.zeros(len(unique_ids))
 
+    # First split: Train vs (Dev + Test)
+    temp_ratio = dev_ratio + test_ratio
+    n_splits_1 = max(2, int(round(1.0 / temp_ratio)))
+    skf1 = StratifiedKFold(n_splits=n_splits_1, shuffle=True, random_state=random_state)
+    train_idx, temp_idx = next(skf1.split(unique_ids, strata))
 
-def create_id_splits(df: pd.DataFrame, id_col: str = '_id', train_ratio: float = 0.7, 
-                     dev_ratio: float = 0.15, test_ratio: float = 0.15, random_state: int = 42) -> Dict[Any, str]:
-    unique_ids = df[id_col].unique()
-    gss1 = GroupShuffleSplit(n_splits=1, test_size=(dev_ratio + test_ratio), random_state=random_state)
-    train_idx, temp_idx = next(gss1.split(unique_ids, groups=unique_ids))
-    train_ids, temp_ids = unique_ids[train_idx], unique_ids[temp_idx]
-    
-    relative_test_ratio = test_ratio / (dev_ratio + test_ratio)
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=relative_test_ratio, random_state=random_state)
-    dev_sub_idx, test_sub_idx = next(gss2.split(temp_ids, groups=temp_ids))
-    
-    dev_ids, test_ids = temp_ids[dev_sub_idx], temp_ids[test_sub_idx]
-    
+    train_ids = unique_ids[train_idx]
+    temp_ids = unique_ids[temp_idx]
+    temp_strata = strata[temp_idx]
+
+    # Second split: Dev vs Test
+    rel_test_ratio = test_ratio / (dev_ratio + test_ratio)
+    n_splits_2 = max(2, int(round(1.0 / rel_test_ratio)))
+    skf2 = StratifiedKFold(n_splits=n_splits_2, shuffle=True, random_state=random_state)
+    dev_sub_idx, test_sub_idx = next(skf2.split(temp_ids, temp_strata))
+
+    dev_ids = temp_ids[dev_sub_idx]
+    test_ids = temp_ids[test_sub_idx]
+
     split_map = {}
-    for _id in train_ids: split_map[_id] = 'train'
-    for _id in dev_ids: split_map[_id] = 'dev'
-    for _id in test_ids: split_map[_id] = 'test'
+    for doc_id in train_ids:
+        split_map[doc_id] = "train"
+    for doc_id in dev_ids:
+        split_map[doc_id] = "dev"
+    for doc_id in test_ids:
+        split_map[doc_id] = "test"
+
     return split_map
 
 
-def mix_abstract_at_ratio(human_sents: List[str], available_models: Dict[str, List[str]], 
-                         target_ratio: float, seed: int) -> Tuple[str, float]:
-    n_sentences = len(human_sents)
-    k = max(1, min(n_sentences - 1, int(round(target_ratio * n_sentences))))
-    rng = random.Random(seed)
-    replace_indices = set(rng.sample(range(n_sentences), k))
-    model_names = list(available_models.keys())
-
-    mixed_sents: List[str] = []
-    for i in range(n_sentences):
-        if i in replace_indices:
-            chosen_model = rng.choice(model_names)
-            model_sents = available_models[chosen_model]
-            llm_sent = model_sents[i] if i < len(model_sents) else model_sents[i % len(model_sents)]
-            mixed_sents.append(llm_sent)
-        else:
-            mixed_sents.append(human_sents[i])
-
-    actual_ratio = k / n_sentences if n_sentences > 0 else 0.0
-    return " ".join(mixed_sents), actual_ratio
-
-
-def generate_synthetic_rows_for_row(row: pd.Series, split_map: Dict[Any, str], 
-                                     target_ratios: List[float] = [0.25, 0.50, 0.75], 
-                                     seed: int = 42) -> List[Dict[str, Any]]:
-    doc_id = row['_id']
-    row_split = split_map.get(doc_id, 'train')
-
-    if row_split != 'test':
-        return []
-
-    meta = {
-        '_id': doc_id,
-        'source': row.get('source', 'unknown'),
-        'keywords': row.get('keywords', None),
-        'year': row.get('year', None),
-        'split': row_split
-    }
-
-    # Pass counts=None here so re-parsing doesn't double count filter statistics
-    human_sents = parse_and_clean_sentence_array(row.get('abstract_sentence', []), counts=None)
-    if len(human_sents) < 3:
-        return []
-
-    valid_models: Dict[str, List[str]] = {}
-    for col in row.index:
-        if col.endswith('_single'):
-            clean_sents = parse_and_clean_sentence_array(row[col], counts=None)
-            if clean_sents:
-                model_name = col.rsplit('_single', 1)[0]
-                valid_models[model_name] = clean_sents
-
-    if not valid_models:
-        return []
-
-    synthetic_rows = []
-    for ratio in target_ratios:
-        seed_str = f"{seed}_{doc_id}_{ratio}"
-        pair_seed = zlib.crc32(seed_str.encode("utf-8"))
-
-        reconstituted_text, actual_ratio = mix_abstract_at_ratio(
-            human_sents=human_sents,
-            available_models=valid_models,
-            target_ratio=ratio,
-            seed=pair_seed
-        )
-
-        synthetic_rows.append({
-            **meta,
-            'text': reconstituted_text,
-            'label': 1,
-            'llm_ratio': actual_ratio,
-            'model_name': 'synthetic_multi',
-            'scope': 'full',
-            'generation_type': 'synthetic_partial'
-        })
-
-    return synthetic_rows
-
-
 def transform_to_long_format(raw_df: pd.DataFrame) -> pd.DataFrame:
-    print("Assigning group-stratified splits on '_id'...")
-    split_map = create_id_splits(raw_df, id_col='_id')
-    raw_df['split'] = raw_df['_id'].map(split_map)
-    
-    # Counter for filtered records
+    id_col = next((c for c in ["_id", "doc_id", "id"] if c in raw_df.columns), "_id")
+    print(f"Assigning source-stratified group splits on '{id_col}'...")
+    split_map = create_id_splits(raw_df, id_col=id_col, stratify_col="source")
+    raw_df["split"] = raw_df[id_col].map(split_map)
+
     filter_counts = {
-        'failed_generation': 0,
-        'failed_validation': 0,
-        'null_or_empty': 0,
-        'other_invalid': 0
+        "failed_generation": 0,
+        "failed_validation": 0,
+        "null_or_empty": 0,
+        "other_invalid": 0
     }
 
     rows: List[Dict[str, Any]] = []
-    meta_cols = ['_id', 'source', 'keywords', 'year', 'split']
-    
-    print("Processing and early-normalizing dataset...")
+    meta_cols = [id_col, "_id", "source", "keywords", "year", "split"]
+    human_cols = {"abstract", "abstract_sentence", "abstract_sentences", "abstract_full"}
+
+    print("Processing, filtering sentinel values, and normalizing text...")
     for idx, row in raw_df.iterrows():
         if (idx + 1) % 500 == 0 or (idx + 1) == len(raw_df):
-            print(f" Processing row {idx + 1}/{len(raw_df)}...", end='\r')
+            print(f" Processing row {idx + 1}/{len(raw_df)}...", end="\r")
 
-        row_split = row['split']
+        row_split = row["split"]
         meta = {col: row[col] for col in meta_cols if col in row}
-        
+        if "_id" not in meta and id_col in meta:
+            meta["_id"] = meta[id_col]
+
         # --- A. Pure Human Text ---
-        if 'abstract' in row and is_valid_sentence(row['abstract'], counts=filter_counts):
+        human_full_val = row.get("abstract") or row.get("abstract_full")
+        if human_full_val is not None and check_and_count_validity(human_full_val, counts=filter_counts):
             rows.append({
-                **meta, 'text': normalize_text(row['abstract']),
-                'label': 0, 'llm_ratio': 0.0, 'model_name': 'human',
-                'scope': 'full', 'generation_type': 'human_full'
+                **meta,
+                "text": normalize_text(human_full_val),
+                "label": 0,
+                "llm_ratio": 0.0,
+                "model_name": "human",
+                "scope": "full",
+                "generation_type": "human_full"
             })
 
-        if 'abstract_sentence' in row:
-            human_sents = parse_and_clean_sentence_array(row['abstract_sentence'], counts=filter_counts)
+        human_sent_val = row.get("abstract_sentence") or row.get("abstract_sentences")
+        if human_sent_val is not None:
+            human_sents = parse_and_clean_sentence_array(human_sent_val)
             for h_sent in human_sents:
                 rows.append({
-                    **meta, 'text': h_sent,
-                    'label': 0, 'llm_ratio': 0.0, 'model_name': 'human',
-                    'scope': 'single', 'generation_type': 'human_single'
+                    **meta,
+                    "text": h_sent,
+                    "label": 0,
+                    "llm_ratio": 0.0,
+                    "model_name": "human",
+                    "scope": "sentence",
+                    "generation_type": "human_sentence"
                 })
 
         # --- B. Model Rewrites ---
         for col in raw_df.columns:
-            if col in meta_cols or col in ['abstract', 'abstract_sentence']:
+            if col in meta_cols or col in human_cols:
                 continue
-            
+
             raw_val = row[col]
             if is_none_or_nan(raw_val):
                 continue
 
-            model_name, suffix = col.rsplit('_', 1)
-            
-            if suffix == 'single':
-                clean_sents = parse_and_clean_sentence_array(raw_val, counts=filter_counts)
+            if "_" not in col:
+                continue
+
+            model_name, suffix = col.rsplit("_", 1)
+
+            if suffix in ["single", "sentence"]:
+                clean_sents = parse_and_clean_sentence_array(raw_val)
                 for s_text in clean_sents:
                     rows.append({
-                        **meta, 'text': s_text,
-                        'label': 1, 'llm_ratio': 1.0, 'model_name': model_name,
-                        'scope': 'single', 'generation_type': 'single_rewrite'
+                        **meta,
+                        "text": s_text,
+                        "label": 1,
+                        "llm_ratio": 1.0,
+                        "model_name": model_name,
+                        "scope": "sentence",
+                        "generation_type": "sentence_rewrite"
                     })
-            elif suffix == 'full':
-                if is_valid_sentence(raw_val, counts=filter_counts):
+            elif suffix == "full":
+                if check_and_count_validity(raw_val, counts=filter_counts):
                     rows.append({
-                        **meta, 'text': normalize_text(raw_val),
-                        'label': 1, 'llm_ratio': 1.0, 'model_name': model_name,
-                        'scope': 'full', 'generation_type': 'full_rewrite'
+                        **meta,
+                        "text": normalize_text(raw_val),
+                        "label": 1,
+                        "llm_ratio": 1.0,
+                        "model_name": model_name,
+                        "scope": "full",
+                        "generation_type": "full_rewrite"
                     })
-            elif suffix in ['25', '50', '75']:
-                if row_split == 'test':
-                    if is_valid_sentence(raw_val, counts=filter_counts):
+            elif suffix in ["25", "50", "75"]:
+                if row_split == "test":
+                    if check_and_count_validity(raw_val, counts=filter_counts):
                         rows.append({
-                            **meta, 'text': normalize_text(raw_val),
-                            'label': 1, 'llm_ratio': float(suffix) / 100.0,
-                            'model_name': model_name, 'scope': 'full',
-                            'generation_type': 'prompt_partial'
+                            **meta,
+                            "text": normalize_text(raw_val),
+                            "label": 1,
+                            "llm_ratio": float(suffix) / 100.0,
+                            "model_name": model_name,
+                            "scope": "full",
+                            "generation_type": "prompt_partial"
                         })
 
         # --- C. Synthetic Partial Mixes ---
-        if row_split == 'test':
-            synth_rows = generate_synthetic_rows_for_row(row, split_map)
+        if row_split == "test":
+            synth_rows = generate_synthetic_rows_for_doc(
+                row=row,
+                target_ratios=[0.25, 0.50, 0.75],
+                seed=42,
+                min_sentences=4
+            )
             rows.extend(synth_rows)
 
-    # Print summary of filtered data
     print("\n\n" + "=" * 45)
     print("          FILTERED DATA SUMMARY          ")
     print("=" * 45)

@@ -1,13 +1,12 @@
-# detection/src/utils/logger.py
+# src/utils/logger.py
 
 import sys
 import logging
 from typing import Optional, Union
-
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_LOG_DIR = PROJECT_ROOT / "outputs" / "logs"
+DEFAULT_LOG_DIR = PROJECT_ROOT / "output_new" / "logs"
 
 
 def setup_logger(
@@ -17,12 +16,11 @@ def setup_logger(
 ) -> logging.Logger:
     """
     Configures a logger with console stream output and optional log file output.
-    All relative log file paths default to /home/gderijck/detection/outputs/logs/.
     """
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
-    # Prevent duplicate handlers if logger is instantiated multiple times
+    # Avoid duplicate handlers if called multiple times
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -31,12 +29,12 @@ def setup_logger(
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # 1. Console Stream Handler
+    # 1. Console Output
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # 2. File Handler
+    # 2. File Output (Optional)
     if log_file:
         log_path = Path(log_file)
         if not log_path.is_absolute():
