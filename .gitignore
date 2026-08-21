@@ -30,15 +30,25 @@ env.bak/
 venv.bak/
 
 # =====================================================================
-# 2. Large Datasets & Static Storage (Root Anchored)
+# 2. Large Datasets & Static Storage
 # =====================================================================
-/data_static/
 /data/
-*.parquet
+/data_static/*
+
+# Un-ignore ONLY raw and preprocessed data folders
+!/data_static/raw/
+!/data_static/preprocessed/
+
+# Ignore old data and feature caches inside preprocessed/
+/data_static/preprocessed/old_data/
+/data_static/preprocessed/betterdata/
+/data_static/preprocessed/stat_cache/
+/data_static/preprocessed/deberta_cache/
+
+# Binary data formats
 *.feather
 *.h5
 *.hdf5
-
 # =====================================================================
 # 3. Model Weights & Binary Checkpoints
 # =====================================================================
