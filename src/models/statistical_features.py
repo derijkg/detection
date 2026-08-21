@@ -132,53 +132,68 @@ def extract_array_trajectory_features(norm_pos: np.ndarray, array_vals: np.ndarr
     return features
 
 
-def extract_ranks_and_entropies_fast(v_logits: np.ndarray, v_labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    T, V = v_logits.shape
-    lse = scipy.special.logsumexp(v_logits, axis=-1, keepdims=True)
-    log_probs = v_logits - lse
+def extract_ranks_and_entropies_fast(v_logits: np.ndarray, v_labels: np.ndarray, temp: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    scaled_logits = v_logits / max(float(temp), 1e-4)
+    T, V = scaled_logits.shape
+    lse = scipy.special.logsumexp(scaled_logits, axis=-1, keepdims=True)
+    log_probs = scaled_logits - lse
     probs = np.exp(log_probs)
 
     raw_log_probs = log_probs[np.arange(T), v_labels]
     surprisals = -raw_log_probs
-    
-    # Safe entropy computation preventing NaN from 0 * log(0)
+
     safe_entropy_terms = np.where(probs > 0.0, -probs * log_probs, 0.0)
     entropies = np.sum(safe_entropy_terms, axis=-1)
 
-    target_logits = v_logits[np.arange(T), v_labels]
+    target_logits = scaled_logits[np.arange(T), v_labels]
     ranks = np.empty(T, dtype=np.float64)
     
     chunk_size = 64
     for start in range(0, T, chunk_size):
         end = min(start + chunk_size, T)
-        ranks[start:end] = np.sum(v_logits[start:end] > target_logits[start:end, None], axis=-1) + 1
+        ranks[start:end] = np.sum(scaled_logits[start:end] > target_logits[start:end, None], axis=-1) + 1
 
     log_ranks = np.log(np.maximum(ranks, 1.0))
     return raw_log_probs, surprisals, entropies, log_ranks, probs
 
 
 def get_default_feature_dict() -> Dict[str, float]:
-    """Provides a complete schema with 0.0 values when text is too short or unparseable."""
+    """Fallback schema with 0.0 values."""
     dummy_pos = np.linspace(0.1, 1.0, 10)
     dummy_vals = np.zeros(10)
     d = {
         "token_length": 0.0,
-        "mean_log_prob": 0.0, "std_log_prob": 0.0,
-        "mean_surprisal": 0.0, "std_surprisal": 0.0,
-        "mean_entropy": 0.0, "std_entropy": 0.0,
-        "mean_log_rank": 0.0, "std_log_rank": 0.0,
-        "mean_gini_coef": 0.0, "std_gini_coef": 0.0,
-        "mean_zipf_alpha": 0.0, "std_zipf_alpha": 0.0,
-        "mean_mandelbrot_beta": 0.0,
-        "mean_top1_top2_margin": 0.0,
+        "mean_log_prob_crit": 0.0, "std_log_prob_crit": 0.0,
+        "mean_surprisal_crit": 0.0, "std_surprisal_crit": 0.0,
+        "mean_entropy_crit": 0.0, "std_entropy_crit": 0.0,
+        "mean_log_rank_crit": 0.0, "std_log_rank_crit": 0.0,
+        "mean_gini_coef_crit": 0.0, "std_gini_coef_crit": 0.0,
+        "mean_zipf_alpha_crit": 0.0, "std_zipf_alpha_crit": 0.0,
+        "mean_mandelbrot_beta_crit": 0.0,
+        "mean_top1_top2_margin_crit": 0.0,
         "fano_factor_burstiness": 0.0,
+        "mean_entropy_frozen": 0.0, "mean_entropy_gas": 0.0,
+        "mean_specific_heat_response": 0.0, "std_specific_heat_response": 0.0,
+        "mean_zipf_critical_residual": 0.0, "max_zipf_critical_residual": 0.0,
+        "mean_thermal_margin_elasticity": 0.0,
     }
-    for pfx in ["zipf", "gini", "ent", "lp"]:
+    for pfx in ["zipf_crit", "gini_crit", "ent_crit", "lp_crit", "spec_heat"]:
         d.update(extract_array_trajectory_features(dummy_pos, dummy_vals, pfx))
     return d
 
 
-def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict[str, float]:
+def extract_text_statistics(
+    text: str, 
+    llm: Any, 
+    max_tokens: int = 1024,
+    t_critical: float = 0.88,
+    t_frozen: float = 0.50,
+    t_gas: float = 1.30
+) -> Dict[str, float]:
+    """
+    Extracts multi-temperature thermodynamic trajectory features spanning
+    the frozen (T=0.50), critical (Tc=0.88), and gas (T=1.30) phases.
+    """
     text_clean = str(text).strip()
     if not text_clean:
         return get_default_feature_dict()
@@ -214,45 +229,73 @@ def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict
     v_logits = shift_logits[valid_positions]
     v_labels = shift_labels[valid_positions]
 
-    raw_log_probs, surprisal, entropies, log_rank, probs = extract_ranks_and_entropies_fast(v_logits, v_labels)
+    # 1. Critical Temperature (Tc) Evaluations
+    lp_c, surp_c, ent_c, rank_c, probs_c = extract_ranks_and_entropies_fast(v_logits, v_labels, temp=t_critical)
 
+    # Margins at Critical State
     top_k_partition = min(2, n_vocab)
-    top2_logits = np.partition(v_logits, -top_k_partition, axis=-1)[:, -top_k_partition:]
-    sorted_top2 = np.sort(top2_logits, axis=-1)
-    lse = scipy.special.logsumexp(v_logits, axis=-1, keepdims=True)
-    p_top1 = np.exp(sorted_top2[:, -1] - lse.squeeze(-1))
-    p_top2 = np.exp(sorted_top2[:, -2] - lse.squeeze(-1)) if top_k_partition >= 2 else np.zeros_like(p_top1)
-    margins = p_top1 - p_top2
+    top2_logits_c = np.partition(v_logits / t_critical, -top_k_partition, axis=-1)[:, -top_k_partition:]
+    sorted_top2_c = np.sort(top2_logits_c, axis=-1)
+    lse_c = scipy.special.logsumexp(v_logits / t_critical, axis=-1, keepdims=True)
+    p_top1_c = np.exp(sorted_top2_c[:, -1] - lse_c.squeeze(-1))
+    p_top2_c = np.exp(sorted_top2_c[:, -2] - lse_c.squeeze(-1)) if top_k_partition >= 2 else np.zeros_like(p_top1_c)
+    margins_c = p_top1_c - p_top2_c
 
-    gini_coefs = compute_vectorized_gini(probs)
-    zipf_alphas = compute_zipf_exponent(v_logits, top_k=20)
-    mb_alphas, mb_betas = compute_zipf_mandelbrot_params(v_logits, top_k=20)
+    gini_coefs_c = compute_vectorized_gini(probs_c)
+    zipf_alphas_unscaled = compute_zipf_exponent(v_logits, top_k=20)
+    zipf_alphas_c = zipf_alphas_unscaled / t_critical
+    mb_alphas_c, mb_betas_c = compute_zipf_mandelbrot_params(v_logits / t_critical, top_k=20)
+
+    # 2. Frozen (T=0.50) & Gas (T=1.30) States for Thermodynamic Derivative Responses
+    _, _, ent_frozen, _, probs_frozen = extract_ranks_and_entropies_fast(v_logits, v_labels, temp=t_frozen)
+    _, _, ent_gas, _, probs_gas = extract_ranks_and_entropies_fast(v_logits, v_labels, temp=t_gas)
+
+    top2_logits_f = np.partition(v_logits / t_frozen, -top_k_partition, axis=-1)[:, -top_k_partition:]
+    sorted_top2_f = np.sort(top2_logits_f, axis=-1)
+    lse_f = scipy.special.logsumexp(v_logits / t_frozen, axis=-1, keepdims=True)
+    margins_frozen = np.exp(sorted_top2_f[:, -1] - lse_f.squeeze(-1)) - (np.exp(sorted_top2_f[:, -2] - lse_f.squeeze(-1)) if top_k_partition >= 2 else 0.0)
+
+    # 3. Response Derivatives
+    specific_heat_proxy = (ent_gas - ent_frozen) / (t_gas - t_frozen)
+    zipf_critical_residuals = np.abs(zipf_alphas_c - 1.0)
+    margin_elasticity = margins_frozen - margins_c
 
     norm_pos = np.linspace(1.0 / total_valid_tokens, 1.0, total_valid_tokens)
 
     stats_dict = {
         "token_length": float(total_valid_tokens),
-        "mean_log_prob": float(np.mean(raw_log_probs)),
-        "std_log_prob": float(np.std(raw_log_probs, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_surprisal": float(np.mean(surprisal)),
-        "std_surprisal": float(np.std(surprisal, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_entropy": float(np.mean(entropies)),
-        "std_entropy": float(np.std(entropies, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_log_rank": float(np.mean(log_rank)),
-        "std_log_rank": float(np.std(log_rank, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_gini_coef": float(np.mean(gini_coefs)),
-        "std_gini_coef": float(np.std(gini_coefs, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_zipf_alpha": float(np.mean(zipf_alphas)),
-        "std_zipf_alpha": float(np.std(zipf_alphas, ddof=1)) if total_valid_tokens > 1 else 0.0,
-        "mean_mandelbrot_beta": float(np.mean(mb_betas)),
-        "mean_top1_top2_margin": float(np.mean(margins)),
-        "fano_factor_burstiness": float(np.var(surprisal) / (np.mean(surprisal) + 1e-8)),
+        "mean_log_prob_crit": float(np.mean(lp_c)),
+        "std_log_prob_crit": float(np.std(lp_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_surprisal_crit": float(np.mean(surp_c)),
+        "std_surprisal_crit": float(np.std(surp_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_entropy_crit": float(np.mean(ent_c)),
+        "std_entropy_crit": float(np.std(ent_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_log_rank_crit": float(np.mean(rank_c)),
+        "std_log_rank_crit": float(np.std(rank_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_gini_coef_crit": float(np.mean(gini_coefs_c)),
+        "std_gini_coef_crit": float(np.std(gini_coefs_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_zipf_alpha_crit": float(np.mean(zipf_alphas_c)),
+        "std_zipf_alpha_crit": float(np.std(zipf_alphas_c, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_mandelbrot_beta_crit": float(np.mean(mb_betas_c)),
+        "mean_top1_top2_margin_crit": float(np.mean(margins_c)),
+        "fano_factor_burstiness": float(np.var(surp_c) / (np.mean(surp_c) + 1e-8)),
+
+        # Multi-Temperature Spectrum Observables
+        "mean_entropy_frozen": float(np.mean(ent_frozen)),
+        "mean_entropy_gas": float(np.mean(ent_gas)),
+        "mean_specific_heat_response": float(np.mean(specific_heat_proxy)),
+        "std_specific_heat_response": float(np.std(specific_heat_proxy, ddof=1)) if total_valid_tokens > 1 else 0.0,
+        "mean_zipf_critical_residual": float(np.mean(zipf_critical_residuals)),
+        "max_zipf_critical_residual": float(np.max(zipf_critical_residuals)),
+        "mean_thermal_margin_elasticity": float(np.mean(margin_elasticity)),
     }
 
-    stats_dict.update(extract_array_trajectory_features(norm_pos, zipf_alphas, "zipf"))
-    stats_dict.update(extract_array_trajectory_features(norm_pos, gini_coefs, "gini"))
-    stats_dict.update(extract_array_trajectory_features(norm_pos, entropies, "ent"))
-    stats_dict.update(extract_array_trajectory_features(norm_pos, raw_log_probs, "lp"))
+    # Extract spatial trajectories along the sequence
+    stats_dict.update(extract_array_trajectory_features(norm_pos, zipf_alphas_c, "zipf_crit"))
+    stats_dict.update(extract_array_trajectory_features(norm_pos, gini_coefs_c, "gini_crit"))
+    stats_dict.update(extract_array_trajectory_features(norm_pos, ent_c, "ent_crit"))
+    stats_dict.update(extract_array_trajectory_features(norm_pos, lp_c, "lp_crit"))
+    stats_dict.update(extract_array_trajectory_features(norm_pos, specific_heat_proxy, "spec_heat"))
 
     return stats_dict
 
@@ -263,11 +306,12 @@ def extract_or_load_statistical_dataset(
     split_name: str, 
     cache_dir: Path,
     repo_id: str = "QuantFactory/Qwen2.5-3B-GGUF",
-    filename: str = "Qwen2.5-3B.Q8_0.gguf"
+    filename: str = "Qwen2.5-3B.Q8_0.gguf",
+    t_critical: float = 0.88
 ) -> pd.DataFrame:
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"stat_features_{scope}_{split_name}_{len(df)}.parquet"
+    cache_file = cache_dir / f"stat_features_{scope}_{split_name}_{len(df)}_tc{int(t_critical*100)}.parquet"
 
     if cache_file.exists():
         return pd.read_parquet(cache_file)
@@ -290,7 +334,7 @@ def extract_or_load_statistical_dataset(
     meta_cols = ["_id", "text", "label", "llm_ratio", "model_name", "generation_type", "source", "year"]
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Extracting Stats [{scope.upper()}]"):
-        feats = extract_text_statistics(row.get("text", ""), llm, max_tokens=max_len)
+        feats = extract_text_statistics(row.get("text", ""), llm, max_tokens=max_len, t_critical=t_critical)
         for mc in meta_cols:
             if mc in row:
                 feats[mc] = row[mc]

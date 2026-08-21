@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.models.base import BaseDetector
@@ -46,29 +47,33 @@ def compute_batch_sampling_discrepancy(
     logits_ref: torch.Tensor,
     logits_score: torch.Tensor,
     labels: torch.Tensor,
-    attention_mask: torch.Tensor
+    attention_mask: torch.Tensor,
+    temperature: float = 0.895,
 ) -> torch.Tensor:
-    if logits_ref.size(-1) != logits_score.size(-1):
-        vocab_size = min(logits_ref.size(-1), logits_score.size(-1))
-        logits_ref = logits_ref[:, :, :vocab_size]
-        logits_score = logits_score[:, :, :vocab_size]
+    inv_t = 1.0 / max(float(temperature), 1e-4)
+    scaled_logits_ref = logits_ref * inv_t
+    scaled_logits_score = logits_score * inv_t
 
-    min_seq_len = min(logits_ref.size(1), logits_score.size(1), labels.size(1))
+    if scaled_logits_ref.size(-1) != scaled_logits_score.size(-1):
+        vocab_size = min(scaled_logits_ref.size(-1), scaled_logits_score.size(-1))
+        scaled_logits_ref = scaled_logits_ref[:, :, :vocab_size]
+        scaled_logits_score = scaled_logits_score[:, :, :vocab_size]
+
+    min_seq_len = min(scaled_logits_ref.size(1), scaled_logits_score.size(1), labels.size(1))
     if min_seq_len == 0:
-        return torch.zeros(logits_score.size(0), device=logits_score.device)
+        return torch.zeros(scaled_logits_score.size(0), device=scaled_logits_score.device)
 
-    logits_ref = logits_ref[:, :min_seq_len, :]
-    logits_score = logits_score[:, :min_seq_len, :]
+    scaled_logits_ref = scaled_logits_ref[:, :min_seq_len, :]
+    scaled_logits_score = scaled_logits_score[:, :min_seq_len, :]
     labels = labels[:, :min_seq_len]
 
-    lprobs_score = torch.log_softmax(logits_score, dim=-1)
-    probs_ref = torch.softmax(logits_ref, dim=-1)
+    lprobs_score = torch.log_softmax(scaled_logits_score, dim=-1)
+    probs_ref = torch.softmax(scaled_logits_ref, dim=-1)
 
     log_likelihood = lprobs_score.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     mean_ref = (probs_ref * lprobs_score).sum(dim=-1)
     var_ref = torch.clamp((probs_ref * torch.square(lprobs_score)).sum(dim=-1) - torch.square(mean_ref), min=0.0)
 
-    # Valid causal transition requires BOTH context token and predicted target token to be non-pad
     context_mask = attention_mask[:, :min_seq_len].float()
     target_mask = attention_mask[:, 1:min_seq_len + 1].float()
     valid_mask = context_mask * target_mask
@@ -88,6 +93,7 @@ class FastDetectGPTDetector(BaseDetector):
         scoring_model_name: str = "Qwen/Qwen2.5-3B-Instruct",
         sampling_model_name: str = "Qwen/Qwen2.5-3B",
         scope: str = "full",
+        temperature: float = 0.895,
         seed: int = 42,
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
@@ -99,6 +105,7 @@ class FastDetectGPTDetector(BaseDetector):
         super().__init__(model_name="fdgpt", scope=scope, seed=seed, log_dir=log_dir)
         self.scoring_model_name = scoring_model_name
         self.sampling_model_name = sampling_model_name
+        self.temperature = float(temperature)
         self.max_length = max_length or (128 if scope == "sentence" else 384)
         self.batch_size = batch_size
         self.cache_dir = cache_dir
@@ -131,16 +138,15 @@ class FastDetectGPTDetector(BaseDetector):
         self.sigma1: float = 1.0
         self.is_calibrated: bool = False
 
-    def compute_discrepancy(self, text: str) -> float:
-        """Evaluates Fast-DetectGPT sampling discrepancy for a single text."""
+    def compute_discrepancy(self, text: str, temperature: Optional[float] = None) -> float:
         text_clean = str(text).strip()
         if not text_clean:
             return 0.0
-        b_scores = self._compute_discrepancy_batch([text_clean])
+        b_scores = self._compute_discrepancy_batch([text_clean], temperature=temperature)
         return float(b_scores[0]) if len(b_scores) > 0 else 0.0
 
-    def _compute_discrepancy_batch(self, batch_texts: List[str]) -> np.ndarray:
-        """Helper to run batched forward passes and return raw discrepancy scores."""
+    def _compute_discrepancy_batch(self, batch_texts: List[str], temperature: Optional[float] = None) -> np.ndarray:
+        temp = temperature if temperature is not None else self.temperature
         tok_kwargs = {
             "return_tensors": "pt",
             "padding": True,
@@ -166,60 +172,48 @@ class FastDetectGPTDetector(BaseDetector):
                 logits_ref=logits_ref,
                 logits_score=logits_score,
                 labels=labels,
-                attention_mask=inputs_score.attention_mask
+                attention_mask=inputs_score.attention_mask,
+                temperature=temp
             )
         return discrepancies.detach().cpu().float().numpy()
 
     def calculate_prob(self, raw_score: float) -> float:
-        """
-        Calculates monotonic probability P(AI | score) using pooled-variance
-        linear calibration to prevent quadratic tail reversals.
-        """
         if not np.isfinite(raw_score):
             return 0.5
 
         if not self.is_calibrated:
             return float(1.0 / (1.0 + np.exp(-raw_score)))
 
-        # Pooled variance linear discriminant calibration enforces strict monotonicity
         sigma_pooled = max(math.sqrt(0.5 * (self.sigma0**2 + self.sigma1**2)), 1e-4)
         delta_mu = self.mu1 - self.mu0
-        
-        # When delta_mu is positive, higher score linearly increases log-odds of being AI
         midpoint = 0.5 * (self.mu0 + self.mu1)
         log_odds = (delta_mu / (sigma_pooled**2)) * (raw_score - midpoint)
         log_odds = np.clip(log_odds, -50.0, 50.0)
 
         return float(1.0 / (1.0 + np.exp(-log_odds)))
 
-    def fit(
-        self, 
-        train_data: Union[pd.DataFrame, List[Dict[str, Any]]], 
-        y_train: Optional[np.ndarray] = None, 
-        batch_size: Optional[int] = None,
-        **kwargs
-    ) -> "FastDetectGPTDetector":
-        df = pd.DataFrame(train_data)
-        if "label" not in df.columns and y_train is not None:
-            df["label"] = y_train
-
-        bs = batch_size or self.batch_size
-        self.logger.info(f"Batched Gaussian calibration on {len(df)} samples (Batch Size: {bs})...")
-
+    def _fit_distribution_at_temp(self, df: pd.DataFrame, temp: float, batch_size: int, show_pbar: bool = True):
+        self.temperature = temp
         for label_val, name in [(0, "Human"), (1, "AI")]:
             sub_df = df[df["label"] == label_val]
             texts = sub_df["text"].dropna().astype(str).tolist()
             scores = []
 
-            for i in range(0, len(texts), bs):
-                batch = texts[i : i + bs]
+            pbar = tqdm(
+                range(0, len(texts), batch_size),
+                desc=f"Calibrating [{name}] (T={temp:.3f})",
+                leave=False,
+                disable=not show_pbar
+            )
+            for i in pbar:
+                batch = texts[i : i + batch_size]
                 try:
-                    b_scores = self._compute_discrepancy_batch(batch)
+                    b_scores = self._compute_discrepancy_batch(batch, temperature=temp)
                     scores.extend(b_scores[np.isfinite(b_scores)].tolist())
                 except Exception as e:
-                    self.logger.warning(f"Batch failed during calibration, falling back to individual scoring: {e}")
+                    self.logger.warning(f"Fallback to single evaluation: {e}")
                     for t in batch:
-                        s = self.compute_discrepancy(t)
+                        s = self.compute_discrepancy(t, temperature=temp)
                         if np.isfinite(s):
                             scores.append(s)
 
@@ -231,8 +225,53 @@ class FastDetectGPTDetector(BaseDetector):
                 self.sigma1 = max(float(np.std(scores, ddof=1)) if len(scores) > 1 else 1.0, 1e-4)
 
         self.is_calibrated = True
-        self.logger.info(f"Fitted Human Distribution: mu0 = {self.mu0:.4f}, sigma0 = {self.sigma0:.4f}")
-        self.logger.info(f"Fitted AI Distribution:    mu1 = {self.mu1:.4f}, sigma1 = {self.sigma1:.4f}")
+
+    def fit(
+        self, 
+        train_data: Union[pd.DataFrame, List[Dict[str, Any]]], 
+        y_train: Optional[np.ndarray] = None, 
+        dev_data: Optional[pd.DataFrame] = None,
+        batch_size: Optional[int] = None,
+        tune_temperature: bool = True,
+        temp_candidates: Tuple[float, ...] = (0.70, 0.80, 0.85, 0.895, 0.95, 1.00),
+        **kwargs
+    ) -> "FastDetectGPTDetector":
+        from src.evaluation.metrics import MetricEvaluator
+
+        df_train = pd.DataFrame(train_data)
+        if "label" not in df_train.columns and y_train is not None:
+            df_train["label"] = y_train
+
+        bs = batch_size or self.batch_size
+
+        if tune_temperature and dev_data is not None and not dev_data.empty:
+            self.logger.info(f"Tuning Fast-DetectGPT temperature on Dev set ({len(dev_data)} samples)...")
+            best_temp = self.temperature
+            best_pauc = -1.0
+
+            temp_pbar = tqdm(temp_candidates, desc="Sweeping Candidate Temperatures", leave=True)
+            for temp in temp_pbar:
+                self._fit_distribution_at_temp(df_train, temp=temp, batch_size=bs, show_pbar=False)
+                dev_probs = self.predict_proba(dev_data)
+                pauc = MetricEvaluator.compute_metric(
+                    y_true=dev_data["label"].values,
+                    y_score=dev_probs,
+                    metric_name="pauc",
+                    max_fpr=0.01
+                )
+                temp_pbar.set_postfix({"Temp": f"{temp:.3f}", "pAUC": f"{pauc:.4f}", "Best": f"{best_pauc:.4f}"})
+                if pauc > best_pauc:
+                    best_pauc = pauc
+                    best_temp = temp
+
+            self.logger.info(f"[+] Selected Optimal Temperature: T* = {best_temp:.3f} (Dev pAUC: {best_pauc:.4f})")
+            self._fit_distribution_at_temp(df_train, temp=best_temp, batch_size=bs, show_pbar=True)
+        else:
+            self.logger.info(f"Calibrating Fast-DetectGPT at Critical Temperature T={self.temperature:.3f}...")
+            self._fit_distribution_at_temp(df_train, temp=self.temperature, batch_size=bs, show_pbar=True)
+
+        self.logger.info(f"Fitted Distribution: mu0 = {self.mu0:.4f}, sigma0 = {self.sigma0:.4f}")
+        self.logger.info(f"Fitted Distribution: mu1 = {self.mu1:.4f}, sigma1 = {self.sigma1:.4f}")
         return self
 
     def predict_proba(self, texts: Union[List[str], List[Dict[str, Any]], pd.DataFrame, np.ndarray]) -> np.ndarray:
@@ -250,9 +289,17 @@ class FastDetectGPTDetector(BaseDetector):
 
         all_probs = []
         batch_size = max(1, self.batch_size)
+        show_pbar = len(raw_texts) > batch_size * 2
 
-        for i in range(0, len(raw_texts), batch_size):
-            batch_texts = raw_texts[i:i + batch_size]
+        pbar = tqdm(
+            range(0, len(raw_texts), batch_size),
+            desc="Fast-DetectGPT Inference",
+            leave=False,
+            disable=not show_pbar
+        )
+
+        for i in pbar:
+            batch_texts = raw_texts[i : i + batch_size]
             try:
                 discrepancies = self._compute_discrepancy_batch(batch_texts)
                 for d in discrepancies:
@@ -282,6 +329,7 @@ class FastDetectGPTDetector(BaseDetector):
             "scoring_model_name": self.scoring_model_name,
             "sampling_model_name": self.sampling_model_name,
             "scope": self.scope,
+            "temperature": self.temperature,
             "max_length": self.max_length,
             "distribution_params": {
                 "mu0": self.mu0, "sigma0": self.sigma0,
@@ -307,6 +355,7 @@ class FastDetectGPTDetector(BaseDetector):
             scoring_model_name=meta["scoring_model_name"],
             sampling_model_name=meta["sampling_model_name"],
             scope=meta.get("scope", "full"),
+            temperature=float(meta.get("temperature", 0.895)),
             max_length=meta.get("max_length", None),
             device=device,
             **kwargs

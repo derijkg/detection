@@ -1,5 +1,6 @@
 # src/training/tune_svm.py
 
+import gc
 import json
 import warnings
 from pathlib import Path
@@ -47,7 +48,7 @@ DEFAULT_SVM_PRIORS = {
 class MergedSVMObjective:
     """
     Optimized cross-validation objective for SVM hyperparameter tuning.
-    Maximizes low-FPR partial AUC (pAUC <= max_fpr).
+    Uses dtype=object string arrays to prevent fixed-width Unicode MemoryErrors.
     """
     def __init__(
         self,
@@ -61,8 +62,9 @@ class MergedSVMObjective:
         max_fpr: float = 0.01,
         seed: int = 42,
     ):
-        self.lemma_texts = np.array(lemma_texts)
-        self.raw_texts = np.array(raw_texts)
+        # Store as object arrays to prevent fixed-width (<U...) memory explosion
+        self.lemma_texts = np.array(lemma_texts, dtype=object)
+        self.raw_texts = np.array(raw_texts, dtype=object)
         self.sty_mat = stylometrics_matrix
         self.labels = labels
         self.groups = groups
@@ -134,7 +136,7 @@ class MergedSVMObjective:
 class SVMOptunaTuner:
     """
     Optuna hyperparameter optimization engine for Linear SVM.
-    Persists trials to SQLite and immediately saves best parameters to disk.
+    Persists trials to SQLite and prevents high-memory allocations.
     """
     @classmethod
     def run(
@@ -205,7 +207,6 @@ class SVMOptunaTuner:
             sampler=optuna.samplers.TPESampler(seed=seed),
         )
 
-        # Enqueue known baseline priors
         initial_params = DEFAULT_SVM_PRIORS.copy()
         if scope == 'sentence':
             initial_params["word_max_ngram"] = 2
