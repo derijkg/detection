@@ -1,0 +1,70 @@
+# configs/custom_experiments.yaml
+seed: 42
+target_fpr: 0.01
+output_dir: "output"
+
+# =========================================================================
+# REUSABLE DATA RECIPES
+# =========================================================================
+data_recipes:
+  # Training Split: Standard Sentences + Sentence-Tokenized Full Abstracts
+  augmented_sentence_train:
+    name: "augmented_sentence_train"
+    splits: ["train"]
+    include_standard_sentences: true
+    include_full_abstract_sentences: true
+    sample_size: -1                     # Full training split
+
+  # Dev Split: Used for FPR calibration and Optuna early-stopping / validation
+  augmented_sentence_dev:
+    name: "augmented_sentence_dev"
+    splits: ["dev"]
+    include_standard_sentences: true
+    include_full_abstract_sentences: true
+    sample_size: -1                     # Full dev split
+
+# =========================================================================
+# EXPERIMENT SPECIFICATIONS
+# =========================================================================
+experiments:
+  # -----------------------------------------------------------------------
+  # 1. LINEAR SVM (TF-IDF + Stylometrics) on Augmented Sentence Data
+  # -----------------------------------------------------------------------
+  - name: "svm_sentence_abstracts_added"
+    model: "svm"
+    scope: "sentence"
+    train_recipe: "augmented_sentence_train"
+    dev_recipe: "augmented_sentence_dev"
+    
+    # Tuning Configuration
+    tune: true
+    n_trials: 30
+    tuning_sample_size: 40000           # Stratified subsample for 3-fold Group CV
+
+    # Evaluation Test Suites
+    eval_benchmarks: ["sentence", "full"]
+
+  # -----------------------------------------------------------------------
+  # 2. mDeBERTa-v3 (CVaR-DRO) on Augmented Sentence Data
+  # -----------------------------------------------------------------------
+  - name: "deberta_sentence_abstracts_added"
+    model: "mdeberta"
+    scope: "sentence"
+    train_recipe: "augmented_sentence_train"
+    dev_recipe: "augmented_sentence_dev"
+    
+    # Architecture & Optimization Knobs
+    max_length: 128
+    batch_size: 32
+    gradient_accumulation_steps: 1
+    epochs: 4
+    learning_rate: 3.0e-5
+    
+    # Optuna Tuning Configuration
+    tune: true
+    n_trials: 15
+    tuning_sample_size: 12000
+    val_sample_size: -1                 # Full dev split for validation during tuning
+
+    # Evaluation Test Suites
+    eval_benchmarks: ["sentence", "full"]

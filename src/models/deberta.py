@@ -116,12 +116,13 @@ class MDeBERTaDetector(BaseDetector):
     """
     Polymorphic BaseDetector for fine-tuned mDeBERTa-v3 sequence classification.
     """
+
     def __init__(
         self,
         model_path: str = "microsoft/mdeberta-v3-base",
-        scope: str = "full",
+        scope: str = "custom",
         max_length: Optional[int] = None,
-        batch_size: int = 32,
+        batch_size: Optional[int] = None,
         seed: int = 42,
         device: Optional[str] = None,
         log_dir: Optional[Union[str, Path]] = None,
@@ -130,15 +131,24 @@ class MDeBERTaDetector(BaseDetector):
         super().__init__(model_name="mdeberta", scope=scope, seed=seed, log_dir=log_dir)
         self.model_path = str(model_path)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.max_length = max_length or (128 if scope == "sentence" else 384)
-        self.batch_size = batch_size
+        
+        # Adaptive default length: 128 for sentence-only, 256 for mixed, 384 for full
+        if max_length is not None:
+            self.max_length = max_length
+        elif "sentence" in scope:
+            self.max_length = 128
+        elif "mixed" in scope or "combined" in scope:
+            self.max_length = 256
+        else:
+            self.max_length = 384
 
+        self.batch_size = batch_size or (32 if self.max_length <= 128 else (16 if self.max_length <= 256 else 8))
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=False)
         config = AutoConfig.from_pretrained(self.model_path)
         config.num_labels = 2
         self.model = CustomMDeBERTaForDetection.from_pretrained(self.model_path, config=config)
         self.model.eval().to(self.device)
-
+        
     def fit(
         self, 
         train_data: Union[pd.DataFrame, List[Dict[str, Any]]], 
