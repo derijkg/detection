@@ -155,6 +155,10 @@ class MDeBERTaDetector(BaseDetector):
         output_dir: Optional[Union[str, Path]] = None,
         tune: bool = False,
         n_trials: int = 10,
+        tuning_sample_size: int = 4000,
+        val_sample_size: int = 2000,
+        batch_size: Optional[int] = None,
+        gradient_accumulation_steps: Optional[int] = None,
         **kwargs
     ) -> "MDeBERTaDetector":
         from src.training.trainer_deberta import (
@@ -170,29 +174,20 @@ class MDeBERTaDetector(BaseDetector):
         if "label" not in df_train.columns and y_train is not None:
             df_train["label"] = y_train
 
-
         out_path = Path(output_dir or f"./output/deberta_{self.scope}")
         out_path.mkdir(parents=True, exist_ok=True)
         scratch_dir = out_path / "checkpoints_tmp"
         params_file = out_path / "best_params.json"
 
-        # 1. Hyperparameter Resolution (Load existing JSON or run Optuna)
-        if params_file.exists() and not tune:
-            self.logger.info(f"Loaded existing best hyperparameters from: {params_file}")
-            best_params = json.loads(params_file.read_text(encoding="utf-8"))
-            lr = float(best_params.get("learning_rate", lr))
-            llrd_decay = float(best_params.get("llrd_decay", llrd_decay))
-            lambda_neg = float(best_params.get("lambda_neg", lambda_neg))
-            weight_decay = float(best_params.get("weight_decay", weight_decay))
-            warmup_ratio = float(best_params.get("warmup_ratio", warmup_ratio))
-
-        elif tune and dev_data is not None:
+        if tune and dev_data is not None:
             self.logger.info(f"Running Optuna tuning for mDeBERTa [{self.scope.upper()}]...")
             best_params, tune_sz = DebertaOptunaTuner.run(
                 train_df=df_train,
                 dev_df=dev_data,
                 scope=self.scope,
                 n_trials=n_trials,
+                tuning_sample_size=tuning_sample_size,
+                val_sample_size=val_sample_size,
                 target_fpr=target_fpr,
                 seed=self.seed,
                 model_name=self.model_path,
@@ -215,28 +210,53 @@ class MDeBERTaDetector(BaseDetector):
                 final_sample_size=len(df_train),
                 n_trials=n_trials
             )
-            
+        elif params_file.exists():
+            self.logger.info(f"Loaded existing best hyperparameters from: {params_file}")
+            best_params = json.loads(params_file.read_text(encoding="utf-8"))
+            lr = float(best_params.get("learning_rate", lr))
+            llrd_decay = float(best_params.get("llrd_decay", llrd_decay))
+            lambda_neg = float(best_params.get("lambda_neg", lambda_neg))
+            weight_decay = float(best_params.get("weight_decay", weight_decay))
+            warmup_ratio = float(best_params.get("warmup_ratio", warmup_ratio))
+
         # 2. Dataset Tokenization & Caching
         train_ds = get_or_create_cached_hf_dataset(df_train, self.tokenizer, max_len=self.max_length, cache_tag=f"train_{self.scope}")
         dev_ds = get_or_create_cached_hf_dataset(dev_data, self.tokenizer, max_len=self.max_length, cache_tag=f"dev_{self.scope}") if dev_data is not None else None
 
-        train_bs = 32 if self.max_length <= 128 else (16 if self.max_length <= 256 else 8)
-        grad_accum = 1 if self.max_length <= 128 else (2 if self.max_length <= 256 else 4)
+
+        train_bs = batch_size or (32 if self.max_length <= 128 else (16 if self.max_length <= 256 else 8))
+        grad_accum = gradient_accumulation_steps or (1 if self.max_length <= 128 else (2 if self.max_length <= 256 else 4))
         use_grad_ckpt = (self.max_length > 256)
         has_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
+        effective_batch_size = train_bs * grad_accum
+        steps_per_epoch = max(1, len(train_ds) // effective_batch_size)
+
+        if dev_ds is not None:
+            eval_steps = max(50, min(500, steps_per_epoch // 4))
+            eval_strategy = "steps"
+            save_strategy = "steps"
+            early_stopping_patience = 5
+        else:
+            eval_steps = None
+            eval_strategy = "no"
+            save_strategy = "no"
+            early_stopping_patience = None
+
         training_args = TrainingArguments(
             output_dir=str(scratch_dir),
-            eval_strategy="epoch" if dev_ds is not None else "no",
-            save_strategy="epoch" if dev_ds is not None else "no",
-            save_total_limit=1,
+            eval_strategy=eval_strategy,
+            save_strategy=save_strategy,
+            eval_steps=eval_steps,
+            save_steps=eval_steps,
+            save_total_limit=2,
             learning_rate=lr,
             warmup_ratio=warmup_ratio,
             weight_decay=weight_decay,
             adam_epsilon=1e-6,
             max_grad_norm=1.0,
             per_device_train_batch_size=train_bs,
-            per_device_eval_batch_size=train_bs * 2,
+            per_device_eval_batch_size=64 if self.max_length <= 128 else 16,
             gradient_accumulation_steps=grad_accum,
             gradient_checkpointing=use_grad_ckpt,
             gradient_checkpointing_kwargs={"use_reentrant": False} if use_grad_ckpt else None,
@@ -253,6 +273,10 @@ class MDeBERTaDetector(BaseDetector):
         cvar_cb = CVaRTrackingCallback(output_dir=out_path)
         sample_weights = compute_stratified_sample_weights(df_train)
 
+        callbacks = [cvar_cb]
+        if dev_ds is not None and early_stopping_patience is not None:
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
+
         trainer = ImbalancedLowFPRTrainer(
             model=self.model,
             args=training_args,
@@ -262,7 +286,7 @@ class MDeBERTaDetector(BaseDetector):
             processing_class=self.tokenizer,
             data_collator=DataCollatorWithPadding(tokenizer=self.tokenizer),
             compute_metrics=compute_deberta_metrics if dev_ds is not None else None,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=2), cvar_cb] if dev_ds is not None else [cvar_cb],
+            callbacks=callbacks,
             use_pauc_loss=use_pauc_loss,
             target_fpr=target_fpr,
             lambda_neg=lambda_neg,

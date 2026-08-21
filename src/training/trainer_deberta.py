@@ -41,17 +41,18 @@ def compute_stratified_sample_weights(df: pd.DataFrame) -> torch.Tensor:
     return torch.tensor(raw_weights, dtype=torch.float32)
 
 
+
 class RockafellarUryasevCVaRLoss(nn.Module):
     """
-    Rockafellar-Uryasev (2000) Conditional Value-at-Risk (CVaR) loss for low-FPR optimization.
-    Penalizes upper alpha-tail of human (negative) sample cross-entropy losses.
+    DDP-safe Rockafellar-Uryasev (2000) Conditional Value-at-Risk (CVaR) loss.
+    Maintains graph continuity for eta across all distributed micro-batch configurations.
     """
     def __init__(self, alpha: float = 0.01, lambda_neg: float = 2.0, initial_eta: float = 0.693, temp: float = 0.1):
         super().__init__()
         self.alpha = float(max(alpha, 1e-4))
         self.lambda_neg = float(lambda_neg)
         self.temp = float(max(temp, 1e-3))
-        self.eta = nn.Parameter(torch.tensor(initial_eta, dtype=torch.float32))
+        self.eta = nn.Parameter(torch.tensor(float(initial_eta), dtype=torch.float32))
         self.ce = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -60,24 +61,26 @@ class RockafellarUryasevCVaRLoss(nn.Module):
         neg_mask = (targets == 0)
 
         n_pos = pos_mask.sum()
-        pos_loss = losses[pos_mask].mean() if n_pos > 0 else torch.tensor(0.0, device=logits.device)
-
         n_neg = neg_mask.sum()
+
+        pos_loss = losses[pos_mask].mean() if n_pos > 0 else (0.0 * logits.sum())
+
+        eta_val = self.eta.to(logits.device)
+
         if n_neg > 0:
             neg_losses = losses[neg_mask]
-            eta_dev = torch.clamp(self.eta.to(logits.device), min=0.0)
-            diff = torch.clamp((neg_losses - eta_dev) / self.temp, -50.0, 50.0)
+            diff = torch.clamp((neg_losses - eta_val) / self.temp, -50.0, 50.0)
             smooth_excess = self.temp * F.softplus(diff)
-            cvar_neg_loss = eta_dev + (1.0 / self.alpha) * smooth_excess.mean()
+            cvar_neg_loss = eta_val + (1.0 / self.alpha) * smooth_excess.mean()
         else:
-            cvar_neg_loss = torch.tensor(0.0, device=logits.device)
+            cvar_neg_loss = 0.0 * eta_val
 
         if n_pos > 0 and n_neg > 0:
             return (pos_loss + self.lambda_neg * cvar_neg_loss) / (1.0 + self.lambda_neg)
         elif n_neg > 0:
             return cvar_neg_loss
         else:
-            return pos_loss
+            return pos_loss + (0.0 * eta_val)
 
 
 class CVaRTrackingCallback(TrainerCallback):
@@ -163,6 +166,7 @@ class ImbalancedLowFPRTrainer(Trainer):
 
             loss_param_ids = set()
             if self.use_pauc_loss and hasattr(self, "custom_loss_fn"):
+                self.custom_loss_fn.to(self.args.device)
                 loss_param_ids = {id(p) for p in self.custom_loss_fn.parameters()}
 
             param_groups: Dict[Tuple[float, float], List[torch.nn.Parameter]] = {}
@@ -193,7 +197,6 @@ class ImbalancedLowFPRTrainer(Trainer):
             ]
 
             if self.use_pauc_loss and hasattr(self, "custom_loss_fn"):
-                self.custom_loss_fn.to(self.args.device)
                 cvar_params = [p for p in self.custom_loss_fn.parameters() if p.requires_grad]
                 if cvar_params:
                     grouped_parameters.append({
@@ -205,7 +208,7 @@ class ImbalancedLowFPRTrainer(Trainer):
             opt_cls, opt_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             self.optimizer = opt_cls(grouped_parameters, **opt_kwargs)
         return self.optimizer
-
+    
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.get("labels")
         outputs = model(**inputs)

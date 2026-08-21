@@ -50,6 +50,9 @@ def get_sampling_discrepancy_analytic(logits_ref: torch.Tensor, logits_score: to
         logits_score = logits_score[:, :, :vocab_size]
 
     min_seq_len = min(logits_ref.size(1), logits_score.size(1), labels.size(1))
+    if min_seq_len == 0:
+        return 0.0
+
     logits_ref = logits_ref[:, :min_seq_len, :]
     logits_score = logits_score[:, :min_seq_len, :]
     labels = labels[:, :min_seq_len]
@@ -65,7 +68,8 @@ def get_sampling_discrepancy_analytic(logits_ref: torch.Tensor, logits_score: to
     var_sum = var_ref.sum(dim=-1).clamp(min=1e-9).sqrt()
     
     discrepancy = (log_likelihood.sum(dim=-1) - mean_ref.sum(dim=-1)) / var_sum
-    return float(discrepancy.mean().item())
+    val = float(discrepancy.mean().item())
+    return val if np.isfinite(val) else 0.0
 
 
 def compute_batch_sampling_discrepancy(
@@ -80,6 +84,9 @@ def compute_batch_sampling_discrepancy(
         logits_score = logits_score[:, :, :vocab_size]
 
     min_seq_len = min(logits_ref.size(1), logits_score.size(1), labels.size(1))
+    if min_seq_len == 0:
+        return torch.zeros(logits_score.size(0), device=logits_score.device)
+
     logits_ref = logits_ref[:, :min_seq_len, :]
     logits_score = logits_score[:, :min_seq_len, :]
     labels = labels[:, :min_seq_len]
@@ -91,10 +98,14 @@ def compute_batch_sampling_discrepancy(
     mean_ref = (probs_ref * lprobs_score).sum(dim=-1)
     var_ref = torch.clamp((probs_ref * torch.square(lprobs_score)).sum(dim=-1) - torch.square(mean_ref), min=0.0)
 
-    mask = attention_mask[:, 1:min_seq_len + 1].float()
-    masked_ll = (log_likelihood * mask).sum(dim=-1)
-    masked_mean = (mean_ref * mask).sum(dim=-1)
-    masked_var = (var_ref * mask).sum(dim=-1)
+    # Valid causal transition requires BOTH the context token and the predicted token to be non-pad
+    context_mask = attention_mask[:, :min_seq_len].float()
+    target_mask = attention_mask[:, 1:min_seq_len + 1].float()
+    valid_mask = context_mask * target_mask
+
+    masked_ll = (log_likelihood * valid_mask).sum(dim=-1)
+    masked_mean = (mean_ref * valid_mask).sum(dim=-1)
+    masked_var = (var_ref * valid_mask).sum(dim=-1)
 
     var_sum = torch.clamp(masked_var, min=1e-9).sqrt()
     discrepancies = (masked_ll - masked_mean) / var_sum
@@ -150,34 +161,43 @@ class FastDetectGPTDetector(BaseDetector):
         self.sigma1: float = 1.0
         self.is_calibrated: bool = False
 
-    def compute_discrepancy(self, text: str) -> Optional[float]:
-        if not text or not str(text).strip():
-            return None
 
-        tok_kwargs = {"return_tensors": "pt", "padding": True, "return_token_type_ids": False}
-        if self.max_length is not None:
-            tok_kwargs.update({"truncation": True, "max_length": self.max_length})
+    def _compute_discrepancy_batch(self, batch_texts: List[str]) -> np.ndarray:
+        """Helper to run batched forward passes and return raw discrepancy scores."""
+        tok_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": (self.max_length is not None),
+            "max_length": self.max_length,
+            "return_token_type_ids": False
+        }
+        inputs_score = self.scoring_tokenizer(batch_texts, **tok_kwargs).to(self.scoring_device)
+        labels = inputs_score.input_ids[:, 1:]
 
-        tokenized_score = self.scoring_tokenizer(text, **tok_kwargs).to(self.scoring_model.device)
-        labels = tokenized_score.input_ids[:, 1:]
         if labels.shape[1] == 0:
-            return None
+            return np.zeros(len(batch_texts), dtype=np.float32)
 
         with torch.inference_mode():
-            logits_score = self.scoring_model(**tokenized_score).logits[:, :-1]
-
+            logits_score = self.scoring_model(**inputs_score).logits[:, :-1]
             if self.is_same_model:
                 logits_ref = logits_score
             else:
-                tokenized_ref = self.sampling_tokenizer(text, **tok_kwargs).to(self.sampling_model.device)
-                logits_ref = self.sampling_model(**tokenized_ref).logits[:, :-1]
-                logits_ref = logits_ref.to(logits_score.device)
+                inputs_ref = self.sampling_tokenizer(batch_texts, **tok_kwargs).to(self.sampling_device)
+                logits_ref = self.sampling_model(**inputs_ref).logits[:, :-1].to(self.scoring_device)
 
-            score = get_sampling_discrepancy_analytic(logits_ref, logits_score, labels)
+            discrepancies = compute_batch_sampling_discrepancy(
+                logits_ref=logits_ref,
+                logits_score=logits_score,
+                labels=labels,
+                attention_mask=inputs_score.attention_mask
+            )
+        return discrepancies.detach().cpu().numpy()
 
-        return score
-
+    
     def calculate_prob(self, raw_score: float) -> float:
+        if not np.isfinite(raw_score):
+            return 0.5
+
         if not self.is_calibrated:
             return float(1.0 / (1.0 + np.exp(-raw_score)))
 
@@ -190,35 +210,51 @@ class FastDetectGPTDetector(BaseDetector):
 
         return float(1.0 / (1.0 + np.exp(-log_odds)))
 
-    def fit(self, train_data: Union[pd.DataFrame, List[Dict[str, Any]]], y_train: Optional[np.ndarray] = None, **kwargs) -> "FastDetectGPTDetector":
+
+    def fit(
+        self, 
+        train_data: Union[pd.DataFrame, List[Dict[str, Any]]], 
+        y_train: Optional[np.ndarray] = None, 
+        batch_size: Optional[int] = None,
+        **kwargs
+    ) -> "FastDetectGPTDetector":
         df = pd.DataFrame(train_data)
         if "label" not in df.columns and y_train is not None:
             df["label"] = y_train
 
-        self.logger.info(f"Calibrating Gaussian discrepancy distribution on {len(df)} samples...")
-        h_scores, ai_scores = [], []
+        bs = batch_size or self.batch_size
+        self.logger.info(f"Batched Gaussian calibration on {len(df)} samples (Batch Size: {bs})...")
 
-        for idx, row in enumerate(tqdm(df.to_dict(orient="records"), desc="Train Distribution Calibration", leave=False)):
-            if idx % 50 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            s = self.compute_discrepancy(row.get("text", ""))
-            if s is not None:
-                if int(row.get("label", 0)) == 0:
-                    h_scores.append(s)
-                else:
-                    ai_scores.append(s)
+        for label_val, name in [(0, "Human"), (1, "AI")]:
+            sub_df = df[df["label"] == label_val]
+            texts = sub_df["text"].dropna().astype(str).tolist()
+            scores = []
 
-        self.mu0 = float(np.mean(h_scores)) if h_scores else 0.0
-        self.sigma0 = max(float(np.std(h_scores, ddof=1)) if len(h_scores) > 1 else 1.0, 1e-4)
-        self.mu1 = float(np.mean(ai_scores)) if ai_scores else 1.0
-        self.sigma1 = max(float(np.std(ai_scores, ddof=1)) if len(ai_scores) > 1 else 1.0, 1e-4)
+            for i in range(0, len(texts), bs):
+                batch = texts[i : i + bs]
+                try:
+                    b_scores = self._compute_discrepancy_batch(batch)
+                    scores.extend(b_scores[np.isfinite(b_scores)].tolist())
+                except Exception as e:
+                    self.logger.warning(f"Batch failed during calibration, falling back to individual scoring: {e}")
+                    for t in batch:
+                        s = self.compute_discrepancy(t)
+                        if s is not None and np.isfinite(s):
+                            scores.append(s)
+
+            if label_val == 0:
+                self.mu0 = float(np.mean(scores)) if scores else 0.0
+                self.sigma0 = max(float(np.std(scores, ddof=1)) if len(scores) > 1 else 1.0, 1e-4)
+            else:
+                self.mu1 = float(np.mean(scores)) if scores else 1.0
+                self.sigma1 = max(float(np.std(scores, ddof=1)) if len(scores) > 1 else 1.0, 1e-4)
+
         self.is_calibrated = True
-
         self.logger.info(f"Fitted Human Distribution: mu0 = {self.mu0:.4f}, sigma0 = {self.sigma0:.4f}")
         self.logger.info(f"Fitted AI Distribution:    mu1 = {self.mu1:.4f}, sigma1 = {self.sigma1:.4f}")
         return self
 
+    
     def predict_proba(self, texts: Union[List[str], List[Dict[str, Any]], pd.DataFrame, np.ndarray]) -> np.ndarray:
         if isinstance(texts, pd.DataFrame):
             raw_texts = texts["text"].astype(str).tolist()

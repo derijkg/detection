@@ -155,10 +155,31 @@ def extract_ranks_and_entropies_fast(v_logits: np.ndarray, v_labels: np.ndarray)
     return raw_log_probs, surprisals, entropies, log_ranks, probs
 
 
+def get_default_feature_dict() -> Dict[str, float]:
+    """Provides a complete schema with 0.0 values when text is too short or unparseable."""
+    dummy_pos = np.linspace(0.1, 1.0, 10)
+    dummy_vals = np.zeros(10)
+    d = {
+        "token_length": 0.0,
+        "mean_log_prob": 0.0, "std_log_prob": 0.0,
+        "mean_surprisal": 0.0, "std_surprisal": 0.0,
+        "mean_entropy": 0.0, "std_entropy": 0.0,
+        "mean_log_rank": 0.0, "std_log_rank": 0.0,
+        "mean_gini_coef": 0.0, "std_gini_coef": 0.0,
+        "mean_zipf_alpha": 0.0, "std_zipf_alpha": 0.0,
+        "mean_mandelbrot_beta": 0.0,
+        "mean_top1_top2_margin": 0.0,
+        "fano_factor_burstiness": 0.0,
+    }
+    for pfx in ["zipf", "gini", "ent", "lp"]:
+        d.update(extract_array_trajectory_features(dummy_pos, dummy_vals, pfx))
+    return d
+
+
 def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict[str, float]:
     text_clean = str(text).strip()
     if not text_clean:
-        return {}
+        return get_default_feature_dict()
 
     tokens = llm.tokenize(text_clean.encode("utf-8"))
     bos_id = llm.token_bos()
@@ -171,7 +192,7 @@ def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict
     if len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
     if len(tokens) < 3:
-        return {}
+        return get_default_feature_dict()
 
     llm.reset()
     llm.eval(tokens)
@@ -186,7 +207,7 @@ def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict
     total_valid_tokens = len(valid_positions)
 
     if total_valid_tokens < 2:
-        return {}
+        return get_default_feature_dict()
 
     v_logits = shift_logits[valid_positions]
     v_labels = shift_labels[valid_positions]
@@ -208,7 +229,7 @@ def extract_text_statistics(text: str, llm: Any, max_tokens: int = 1024) -> Dict
     norm_pos = np.linspace(1.0 / total_valid_tokens, 1.0, total_valid_tokens)
 
     stats_dict = {
-        "token_length": total_valid_tokens,
+        "token_length": float(total_valid_tokens),
         "mean_log_prob": float(np.mean(raw_log_probs)),
         "std_log_prob": float(np.std(raw_log_probs, ddof=1)) if total_valid_tokens > 1 else 0.0,
         "mean_surprisal": float(np.mean(surprisal)),
@@ -268,9 +289,6 @@ def extract_or_load_statistical_dataset(
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Extracting Stats [{scope.upper()}]"):
         feats = extract_text_statistics(row.get("text", ""), llm, max_tokens=max_len)
-        if not feats:
-            feats = {"mean_surprisal": 0.0, "mean_entropy": 0.0, "mean_gini_coef": 0.0}
-
         for mc in meta_cols:
             if mc in row:
                 feats[mc] = row[mc]

@@ -1,6 +1,7 @@
 # src/training/tune_deberta.py
 
 import gc
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -39,7 +40,6 @@ DEBERTA_SEARCH_SPACES = {
     "warmup_ratio": "$[0.05, 0.15]$",
 }
 
-# Strong baseline defaults used to warm-start Optuna (Trial 0)
 DEFAULT_DEBERTA_PRIORS = {
     "learning_rate": 1.8272e-05,
     "llrd_decay": 0.9426,
@@ -49,6 +49,17 @@ DEFAULT_DEBERTA_PRIORS = {
 }
 
 
+def generate_df_content_hash(df: pd.DataFrame) -> str:
+    """Generates a fast, deterministic content hash of the dataframe texts and labels."""
+    hasher = hashlib.md5()
+    sample_texts = df["text"].dropna().astype(str).values[:500]
+    for t in sample_texts:
+        hasher.update(t.encode("utf-8", errors="ignore"))
+    if "label" in df.columns:
+        hasher.update(df["label"].values[:500].tobytes())
+    return hasher.hexdigest()[:10]
+
+
 def get_or_create_cached_hf_dataset(
     df: pd.DataFrame, 
     tokenizer: AutoTokenizer, 
@@ -56,10 +67,10 @@ def get_or_create_cached_hf_dataset(
     cache_tag: str
 ) -> Dataset:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = CACHE_DIR / f"{cache_tag}_{len(df)}_{max_len}"
+    content_hash = generate_df_content_hash(df)
+    cache_path = CACHE_DIR / f"{cache_tag}_{len(df)}_{content_hash}_{max_len}"
 
     if cache_path.exists():
-        print(f"Loaded cached tokenized dataset from: {cache_path}")
         return load_from_disk(str(cache_path))
 
     df_clean = df.copy()
@@ -97,7 +108,7 @@ class DebertaOptunaTuner:
         scope: str = "full",
         n_trials: int = 10,
         tuning_sample_size: int = 4000,
-        val_sample_size: int = 2000,
+        val_sample_size: int = -1,
         model_name: str = "microsoft/mdeberta-v3-base",
         target_fpr: float = 0.01,
         seed: int = 42,
@@ -106,7 +117,8 @@ class DebertaOptunaTuner:
 
         set_seed(seed)
         max_len = 128 if scope == "sentence" else 384
-        batch_size = 32 if scope == "sentence" else 8
+        train_batch_size = 32 if scope == "sentence" else 8
+        eval_batch_size = 64 if scope == "sentence" else 16
         grad_accum = 1 if scope == "sentence" else 4
 
         out_path = Path(output_dir or f"./output/deberta_{scope}")
@@ -115,17 +127,12 @@ class DebertaOptunaTuner:
         db_path = out_path / "optuna_study.db"
         storage_url = f"sqlite:///{db_path.resolve()}"
 
-        print(f"\n==================================================================")
-        print(f"   RUNNING mDeBERTa OPTUNA TUNING [{scope.upper()}] ({n_trials} Trials)   ")
-        print(f"   Database Storage : {storage_url}")
-        print(f"   Live Params File : {params_file}")
-        print(f"==================================================================")
-
+        # 1. Stratified Training Subsample
         if train_df is not None:
             df_train = train_df.copy()
             if 0 < tuning_sample_size < len(df_train):
-                id_col = '_id' if '_id' in df_train.columns else 'id'
-                if id_col in df_train.columns:
+                id_col = next((c for c in ['_id', 'doc_id', 'id'] if c in df_train.columns), None)
+                if id_col:
                     u_ids = df_train[id_col].unique()
                     target_groups = max(1, int(tuning_sample_size / (len(df_train) / len(u_ids))))
                     rng = np.random.default_rng(seed)
@@ -138,6 +145,7 @@ class DebertaOptunaTuner:
         else:
             raise ValueError("Either `train_df` or `manager` must be provided.")
 
+        # 2. Validation Sample Resolution (Full Dev Set supported if val_sample_size <= 0)
         if dev_df is not None:
             df_val = dev_df.copy()
             if 0 < val_sample_size < len(df_val):
@@ -148,6 +156,15 @@ class DebertaOptunaTuner:
             raise ValueError("Either `dev_df` or `manager` must be provided.")
 
         actual_tune_size = len(df_train)
+        actual_val_size = len(df_val)
+
+        print(f"\n==================================================================")
+        print(f"   RUNNING mDeBERTa OPTUNA TUNING [{scope.upper()}] ({n_trials} Trials)   ")
+        print(f"   Train Tuning Size: {actual_tune_size:,} | Validation Size: {actual_val_size:,}")
+        print(f"   Database Storage : {storage_url}")
+        print(f"   Live Params File : {params_file}")
+        print(f"==================================================================")
+
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
         train_ds = get_or_create_cached_hf_dataset(
@@ -160,9 +177,14 @@ class DebertaOptunaTuner:
         sample_weights = compute_stratified_sample_weights(df_train)
 
         # Persistent SQLite study
+        storage = optuna.storages.RDBStorage(
+            url=storage_url,
+            engine_kwargs={"connect_args": {"timeout": 60}}
+        )
+
         study = optuna.create_study(
             study_name=f"mdeberta_{scope}",
-            storage=storage_url,
+            storage=storage,
             load_if_exists=True,
             direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=seed),
@@ -207,12 +229,13 @@ class DebertaOptunaTuner:
                 warmup_ratio=warmup,
                 weight_decay=wd,
                 max_grad_norm=1.0,
-                per_device_train_batch_size=batch_size,
-                per_device_eval_batch_size=batch_size * 2,
+                per_device_train_batch_size=train_batch_size,
+                per_device_eval_batch_size=eval_batch_size,
                 gradient_accumulation_steps=grad_accum,
                 gradient_checkpointing=(scope == "full"),
                 gradient_checkpointing_kwargs=({"use_reentrant": False} if scope == "full" else None),
                 bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+                fp16=(not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) and torch.cuda.is_available()),
                 num_train_epochs=1,
                 report_to="none",
                 logging_steps=25,
@@ -255,7 +278,6 @@ class DebertaOptunaTuner:
         with TqdmOptunaCallback(n_trials=n_trials, desc=f"Tuning DeBERTa [{scope.upper()}]", save_path=params_file) as opt_cb:
             study.optimize(objective, n_trials=n_trials, callbacks=[opt_cb])
 
-        # Strip internal metadata before returning
         best_clean_params = {k: v for k, v in study.best_params.items() if not k.startswith("_")}
         print(f"\n-> Best mDeBERTa Parameters ({scope}): {best_clean_params} | pAUC={study.best_value:.4f}")
         return best_clean_params, actual_tune_size

@@ -30,6 +30,11 @@ nltk.download('stopwords', quiet=True)
 nltk.download('punkt', quiet=True)
 from nltk.corpus import stopwords
 
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+import warnings
+
+warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
+
 _nlp = None
 _dutch_stopwords_lemmatized = None
 RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
@@ -351,6 +356,7 @@ class SVMDetector(BaseDetector):
         dev_data: Optional[pd.DataFrame] = None,
         tune: bool = False,
         n_trials: int = 10,
+        tuning_sample_size: int = 15000,
         target_fpr: float = 0.01,
         output_dir: Optional[Union[str, Path]] = None,
         **kwargs
@@ -358,7 +364,6 @@ class SVMDetector(BaseDetector):
         df_train = pd.DataFrame(train_data)
         if "label" not in df_train.columns and y_train is not None:
             df_train["label"] = y_train
-
 
         out_path = Path(output_dir or f"./output/svm_{self.scope}")
         out_path.mkdir(parents=True, exist_ok=True)
@@ -372,11 +377,11 @@ class SVMDetector(BaseDetector):
                 train_df=df_train,
                 scope=self.scope,
                 n_trials=n_trials,
+                tuning_sample_size=tuning_sample_size,
                 target_fpr=target_fpr,
                 seed=self.seed,
                 output_dir=out_path
             )
-
             w_params = TFIDFParamBuilder.parse_best_tfidf(best_params, 'word', granularity=self.scope)
             c_params = TFIDFParamBuilder.parse_best_tfidf(best_params, 'char', granularity=self.scope)
             sty_params = {
@@ -428,7 +433,7 @@ class SVMDetector(BaseDetector):
                 calibrate=True
             )
             self.pipeline = Pipeline([('features', feat_pipe), ('classifier', clf)])
-            
+
             if output_dir:
                 latex_dir = Path(output_dir) / "latex_tables"
                 latex_dir.mkdir(parents=True, exist_ok=True)
@@ -494,16 +499,22 @@ class SVMDetector(BaseDetector):
 
             if isinstance(clf_step, CalibratedClassifierCV):
                 estimators = [getattr(cc, 'estimator', getattr(cc, 'base_estimator', None)) for cc in clf_step.calibrated_classifiers_]
-                weights = np.mean([est.coef_.flatten() for est in estimators if est is not None], axis=0)
+                valid_ests = [est for est in estimators if est is not None and hasattr(est, 'coef_')]
+                if not valid_ests:
+                    return pd.DataFrame()
+                weights = np.mean([est.coef_.flatten() for est in valid_ests], axis=0)
             else:
                 weights = clf_step.coef_.flatten()
 
             min_len = min(len(feature_names), len(weights))
-            return pd.DataFrame({"feature": feature_names[:min_len], "weight": weights[:min_len]})
+            return pd.DataFrame({
+                "feature": feature_names[:min_len], 
+                "weight": weights[:min_len]
+            })
         except Exception as e:
             self.logger.warning(f"Could not extract feature importances: {e}")
             return pd.DataFrame()
-
+        
     def save(self, path: Union[str, Path]):
         save_p = Path(path)
         if save_p.is_dir() or not str(save_p).endswith(".joblib"):

@@ -72,6 +72,7 @@ class MetricEvaluator:
             
         return float(roc_auc_score(y_true, y_score))
 
+
     @staticmethod
     def find_threshold_for_max_fpr(
         y_true: np.ndarray, 
@@ -79,7 +80,8 @@ class MetricEvaluator:
         target_fpr: float = 0.01
     ) -> float:
         """
-        Calculates the decision threshold enforcing FPR <= target_fpr on the negative (human) distribution.
+        Calculates a conservative decision threshold enforcing FPR <= target_fpr 
+        on the negative (human) distribution without fractional boundary leakage.
         """
         y_true = np.asarray(y_true, dtype=int)
         y_score = np.asarray(y_score, dtype=float)
@@ -88,8 +90,11 @@ class MetricEvaluator:
         if len(neg_scores) == 0:
             return 0.5
 
-        return float(np.quantile(neg_scores, 1.0 - target_fpr))
+        # 'higher' ensures the threshold is set to the actual observed score 
+        # at or above the quantile, strictly bounding FPR <= target_fpr
+        return float(np.quantile(neg_scores, 1.0 - target_fpr, method="higher"))
 
+    
     @staticmethod
     def find_threshold_for_best_f1(
         y_true: np.ndarray, 

@@ -6,8 +6,10 @@ import unicodedata
 from collections import Counter
 from typing import Dict, List, Optional
 import numpy as np
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+import warnings
 
+warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
 DUTCH_TRANSITIONS = {
     "echter", "bovendien", "daarnaast", "desalniettemin", "kortom",
     "tevens", "daardoor", "derhalve", "bijgevolg", "namelijk"

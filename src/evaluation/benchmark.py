@@ -63,6 +63,7 @@ def _get_positive_probs(model, data: Union[List[Dict], pd.DataFrame]) -> np.ndar
 
 class BenchmarkOrchestrator:
 
+
     @staticmethod
     def _attach_prediction_diagnostics(
         df: pd.DataFrame, 
@@ -79,20 +80,24 @@ class BenchmarkOrchestrator:
         if has_labels and 'label' in pred_df.columns:
             y_true = pred_df['label'].astype(int).values
             pred_df['is_correct'] = (preds == y_true).astype(int)
-            error_types = []
-            for yt, yp in zip(y_true, preds):
-                if yt == 1 and yp == 1: error_types.append("TP")
-                elif yt == 0 and yp == 0: error_types.append("TN")
-                elif yt == 0 and yp == 1: error_types.append("FP")
-                else: error_types.append("FN")
-            pred_df['error_type'] = error_types
+            
+            # Vectorized TP/TN/FP/FN assignment
+            conditions = [
+                (y_true == 1) & (preds == 1),
+                (y_true == 0) & (preds == 0),
+                (y_true == 0) & (preds == 1),
+                (y_true == 1) & (preds == 0)
+            ]
+            choices = ["TP", "TN", "FP", "FN"]
+            pred_df['error_type'] = np.select(conditions, choices, default="UNKNOWN")
 
         if 'text' in pred_df.columns:
-            pred_df['word_count'] = pred_df['text'].astype(str).apply(lambda x: len(x.split()))
-            pred_df['char_count'] = pred_df['text'].astype(str).apply(len)
+            text_series = pred_df['text'].fillna("").astype(str)
+            pred_df['word_count'] = text_series.str.split().str.len()
+            pred_df['char_count'] = text_series.str.len()
 
         return pred_df
-
+    
     @classmethod
     def run_full_benchmark(
         cls,

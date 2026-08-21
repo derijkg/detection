@@ -103,3 +103,4 @@ htmlcov/
 export.py
 codebase_dump.md
 evaluation_summary.json
+profile_data.py
