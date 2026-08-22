@@ -1,4 +1,7 @@
-# src/utils/optuna_utils.py
+"""
+src/utils/optuna_utils.py
+Interactive TQDM progress tracking and continuous parameter checkpointing callback for Optuna studies.
+"""
 
 import json
 from pathlib import Path
@@ -10,17 +13,8 @@ from tqdm.auto import tqdm
 
 
 class TqdmOptunaCallback:
-    """
-    Optuna callback that:
-    1. Tracks optimization progress with a clean tqdm progress bar.
-    2. Immediately saves `best_params.json` to disk whenever a new best score is reached.
-    """
-    def __init__(
-        self, 
-        n_trials: int, 
-        desc: str = "Tuning Optuna", 
-        save_path: Optional[Union[str, Path]] = None
-    ):
+
+    def __init__(self, n_trials: int, desc: str = "Tuning Optuna", save_path: Optional[Union[str, Path]] = None):
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         self.pbar = tqdm(total=n_trials, desc=desc, dynamic_ncols=True, leave=True)
         self.best_value: Optional[float] = None
@@ -35,40 +29,32 @@ class TqdmOptunaCallback:
             if self.best_value is None:
                 is_new_best = True
             elif is_maximize:
-                is_new_best = trial.value > self.best_value
+                is_new_best = (trial.value > self.best_value)
             else:
-                is_new_best = trial.value < self.best_value
+                is_new_best = (trial.value < self.best_value)
 
-            if is_new_best:
+            if is_new_best and trial.value is not None:
                 self.best_value = trial.value
                 self.best_trial_num = trial.number
-
-                # Dynamically write best parameters to disk immediately
                 if self.save_path:
                     try:
                         self.save_path.parent.mkdir(parents=True, exist_ok=True)
                         payload = {
-                            "_best_metric_value": float(self.best_value),
-                            "_best_trial_number": int(self.best_trial_num),
+                            '_best_metric_value': float(self.best_value),
+                            '_best_trial_number': int(self.best_trial_num),
                             **trial.params
                         }
-                        self.save_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                        self.save_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
                     except Exception as e:
                         print(f"\n[Warning] Could not dynamically save best params: {e}")
 
-            self.pbar.set_postfix({
-                "Best": f"{self.best_value:.4f} (#{self.best_trial_num})",
-                "Last": f"{trial.value:.4f}",
-                "Status": "COMPLETE"
-            })
+            val_str = f"{self.best_value:.4f}" if self.best_value is not None else "N/A"
+            last_str = f"{trial.value:.4f}" if trial.value is not None else "N/A"
+            self.pbar.set_postfix({'Best': f"{val_str} (#{self.best_trial_num})", 'Last': last_str, 'Status': 'COMPLETE'})
 
         elif trial.state == TrialState.PRUNED:
-            best_str = f"{self.best_value:.4f} (#{self.best_trial_num})" if self.best_value is not None else "N/A"
-            self.pbar.set_postfix({
-                "Best": best_str,
-                "Last": "Pruned",
-                "Status": "PRUNED"
-            })
+            val_str = f"{self.best_value:.4f}" if self.best_value is not None else "N/A"
+            self.pbar.set_postfix({'Best': f"{val_str} (#{self.best_trial_num})", 'Last': 'Pruned', 'Status': 'PRUNED'})
 
     def close(self):
         self.pbar.close()

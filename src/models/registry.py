@@ -1,5 +1,4 @@
 # src/models/registry.py
-
 from typing import Any, Dict, Type
 from src.models.base import BaseDetector
 from src.models.svm_pipeline import SVMDetector
@@ -8,67 +7,66 @@ from src.models.statistical_detector import StatisticalTrajectoryDetector
 from src.models.deberta import MDeBERTaDetector
 
 MODEL_METADATA: Dict[str, Dict[str, Any]] = {
-    "svm": {
-        "class": SVMDetector,
-        "canonical": "svm",
-        "display_name": "Linear SVM (TF-IDF + Stylo)",
-        "color": "#1f77b4",
+    'svm': {
+        'class': SVMDetector,
+        'canonical': 'svm',
+        'display_name': 'Linear SVM (TF-IDF + Stylo)',
+        'color': '#1f77b4'
     },
-    "mdeberta": {
-        "class": MDeBERTaDetector,
-        "canonical": "deberta",
-        "display_name": "mDeBERTa-v3 (CVaR-DRO)",
-        "color": "#d62728",
+    'mdeberta': {
+        'class': MDeBERTaDetector,
+        'canonical': 'deberta',
+        'display_name': 'mDeBERTa-v3 (CVaR-DRO)',
+        'color': '#d62728'
     },
-    "fdgpt": {
-        "class": FastDetectGPTDetector,
-        "canonical": "fdgpt",
-        "display_name": "Fast-DetectGPT (Zero-Shot)",
-        "color": "#2ca02c",
+    'fdgpt': {
+        'class': FastDetectGPTDetector,
+        'canonical': 'fdgpt',
+        'display_name': 'Fast-DetectGPT (Zero-Shot)',
+        'color': '#2ca02c'
     },
-    "stat_trajectory": {
-        "class": StatisticalTrajectoryDetector,
-        "canonical": "stat",
-        "display_name": "LLM Trajectory (Ours)",
-        "color": "#9467bd",
-    },
+    'stat_trajectory': {
+        'class': StatisticalTrajectoryDetector,
+        'canonical': 'stat',
+        'display_name': 'LLM Trajectory (Ours)',
+        'color': '#9467bd'
+    }
 }
 
-# Alias resolution mapping
 ALIAS_MAP: Dict[str, str] = {
-    "svm": "svm",
-    "mdeberta": "mdeberta",
-    "deberta": "mdeberta",
-    "fdgpt": "fdgpt",
-    "fast_detect_gpt": "fdgpt",
-    "fast_detectgpt": "fdgpt",
-    "stat_trajectory": "stat_trajectory",
-    "stat": "stat_trajectory",
+    'svm': 'svm',
+    'mdeberta': 'mdeberta',
+    'deberta': 'mdeberta',
+    'fdgpt': 'fdgpt',
+    'fast_detect_gpt': 'fdgpt',
+    'fast_detectgpt': 'fdgpt',
+    'stat_trajectory': 'stat_trajectory',
+    'stat': 'stat_trajectory'
 }
-
 
 def normalize_model_name(name: str) -> str:
-    key = name.lower()
-    if key not in ALIAS_MAP:
-        raise ValueError(f"Unknown model '{name}'. Available: {list(ALIAS_MAP.keys())}")
-    return ALIAS_MAP[key]
-
+    key = str(name).lower()
+    if key in ALIAS_MAP:
+        return ALIAS_MAP[key]
+    for prefix in ['deberta', 'mdeberta', 'svm', 'fdgpt', 'fast_detect_gpt', 'fast_detectgpt', 'stat_trajectory', 'stat']:
+        if prefix in key:
+            return ALIAS_MAP.get(prefix, prefix)
+    return key
 
 def get_detector_class(name: str) -> Type[BaseDetector]:
     canonical_key = normalize_model_name(name)
-    return MODEL_METADATA[canonical_key]["class"]
-
+    if canonical_key not in MODEL_METADATA:
+        raise ValueError(f"Unknown model '{name}'. Available: {list(MODEL_METADATA.keys())}")
+    return MODEL_METADATA[canonical_key]['class']
 
 def get_model_display_name(name: str) -> str:
     canonical_key = normalize_model_name(name)
-    return MODEL_METADATA[canonical_key]["display_name"]
-
+    return MODEL_METADATA.get(canonical_key, {}).get('display_name', str(name))
 
 def get_model_color(name: str) -> str:
     canonical_key = normalize_model_name(name)
-    return MODEL_METADATA[canonical_key]["color"]
-
+    return MODEL_METADATA.get(canonical_key, {}).get('color', '#333333')
 
 def get_canonical_directory_name(name: str) -> str:
     canonical_key = normalize_model_name(name)
-    return MODEL_METADATA[canonical_key]["canonical"]
+    return MODEL_METADATA.get(canonical_key, {}).get('canonical', canonical_key)

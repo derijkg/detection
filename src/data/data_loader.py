@@ -33,6 +33,30 @@ try:
 except ImportError:
     HAS_TRANSFORMERS = False
 
+def group_stratified_sample(
+    df: pd.DataFrame, 
+    sample_size: int, 
+    seed: int = 42, 
+    id_candidates: Tuple[str, ...] = ("_id", "doc_id", "id")
+) -> pd.DataFrame:
+    """
+    Subsamples rows by grouping unique document IDs together to preserve group integrity.
+    """
+    if sample_size <= 0 or len(df) <= sample_size:
+        return df
+
+    id_col = next((c for c in id_candidates if c in df.columns), None)
+    if id_col:
+        unique_ids = df[id_col].unique()
+        avg_rows = len(df) / max(len(unique_ids), 1)
+        target_groups = max(1, int(sample_size / avg_rows))
+        
+        if target_groups < len(unique_ids):
+            rng = np.random.default_rng(seed)
+            sampled_ids = rng.choice(unique_ids, size=target_groups, replace=False)
+            return df[df[id_col].isin(sampled_ids)].copy().reset_index(drop=True)
+            
+    return df.sample(n=sample_size, random_state=seed).reset_index(drop=True)
 
 @dataclass
 class TextSample:
@@ -161,18 +185,7 @@ class DetectionDataManager:
 
         # 5. Group-Stratified Subsampling on _id
         if sample_size > 0 and len(df) > sample_size:
-            id_col = next((c for c in ['_id', 'doc_id', 'id'] if c in df.columns), None)
-            if id_col:
-                unique_ids = df[id_col].unique()
-                avg_rows = len(df) / max(len(unique_ids), 1)
-                target_groups = max(1, int(sample_size / avg_rows))
-                
-                if target_groups < len(unique_ids):
-                    rng = np.random.default_rng(seed)
-                    sampled_ids = rng.choice(unique_ids, size=target_groups, replace=False)
-                    df = df[df[id_col].isin(sampled_ids)].copy().reset_index(drop=True)
-            else:
-                df = df.sample(n=sample_size, random_state=seed).reset_index(drop=True)
+            df = group_stratified_sample(df, sample_size=sample_size, seed=seed)
 
         return df
 

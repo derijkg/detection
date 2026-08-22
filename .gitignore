@@ -101,8 +101,10 @@ notebooks/.ipynb_checkpoints/
 .coverage
 htmlcov/
 
-export.py
-codebase_dump.md
+codebase*
 evaluation_summary.json
 profile_data.py
 /experiments/
+TODO.md
+/notebooks/
+/tests/
